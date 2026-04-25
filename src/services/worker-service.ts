@@ -76,7 +76,7 @@ import {
 
 // Service layer imports
 import { DatabaseManager } from './worker/DatabaseManager.js';
-import { SessionManager } from './worker/SessionManager.js';
+import { MAX_SESSION_IDLE_MS, SessionManager } from './worker/SessionManager.js';
 import { SSEBroadcaster } from './worker/SSEBroadcaster.js';
 import { SDKAgent } from './worker/SDKAgent.js';
 import { GeminiAgent, isGeminiSelected, isGeminiAvailable } from './worker/GeminiAgent.js';
@@ -134,6 +134,9 @@ export function buildStatusOutput(status: 'ready' | 'error', message?: string): 
 }
 
 export class WorkerService {
+  private static readonly MAX_RECOVERY_SESSION_AGE_MS = 4 * 60 * 60 * 1000;
+  private static readonly STALE_ACTIVE_NO_QUEUE_SESSION_AGE_MS = MAX_SESSION_IDLE_MS;
+
   private server: Server;
   private startTime: number = Date.now();
   private mcpClient: Client;
@@ -146,7 +149,7 @@ export class WorkerService {
   // Service layer
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
-  private sseBroadcaster: SSEBroadcaster;
+  public sseBroadcaster: SSEBroadcaster;
   private sdkAgent: SDKAgent;
   private geminiAgent: GeminiAgent;
   private openRouterAgent: OpenRouterAgent;
@@ -487,6 +490,12 @@ export class WorkerService {
       const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');
       this.mcpReady = existsSync(mcpServerPath);
 
+      // Runtime maintenance must not depend on the best-effort MCP loopback
+      // self-check below. Queue recovery and stale-active cleanup are core DB
+      // janitors; skipping them when MCP self-check fails leaves no-queue active
+      // rows orphaned until a later manual recovery.
+      this.startRuntimeMaintenance();
+
       // Best-effort loopback MCP self-check
       getSupervisor().assertCanSpawn('mcp server');
       const transport = new StdioClientTransport({
@@ -539,8 +548,15 @@ export class WorkerService {
         });
       }
       logger.success('WORKER', 'MCP loopback self-check connected');
+    } catch (error) {
+      logger.error('SYSTEM', 'Background initialization failed', {}, error as Error);
+      throw error;
+    }
+  }
 
-      // Start orphan reaper to clean up zombie processes (Issue #737)
+  private startRuntimeMaintenance(): void {
+    // Start orphan reaper to clean up zombie processes (Issue #737)
+    if (!this.stopOrphanReaper) {
       this.stopOrphanReaper = startOrphanReaper(() => {
         const activeIds = new Set<number>();
         for (const [id] of this.sessionManager['sessions']) {
@@ -549,13 +565,19 @@ export class WorkerService {
         return activeIds;
       });
       logger.info('SYSTEM', 'Started orphan reaper (runs every 30 seconds)');
+    }
 
-      // Reap stale sessions to unblock orphan process cleanup (Issue #1168)
+    // Reap stale sessions to unblock orphan process cleanup (Issue #1168)
+    if (!this.staleSessionReaperInterval) {
       this.staleSessionReaperInterval = setInterval(async () => {
         try {
           const reaped = await this.sessionManager.reapStaleSessions();
           if (reaped > 0) {
             logger.info('SYSTEM', `Reaped ${reaped} stale sessions`);
+          }
+          const cleaned = this.cleanupStaleActiveSessionsWithoutWork();
+          if (cleaned > 0) {
+            logger.info('SYSTEM', `Marked ${cleaned} stale active sessions without active queue as failed`);
           }
         } catch (e) {
           // [ANTI-PATTERN IGNORED]: setInterval callback cannot throw; reaper retries on next tick (every 2 min)
@@ -594,23 +616,21 @@ export class WorkerService {
           }
         }
       }, 2 * 60 * 1000);
-
-      // Auto-recover orphaned queues (fire-and-forget with error logging)
-      this.processPendingQueues(50).then(result => {
-        if (result.sessionsStarted > 0) {
-          logger.info('SYSTEM', `Auto-recovered ${result.sessionsStarted} sessions with pending work`, {
-            totalPending: result.totalPendingSessions,
-            started: result.sessionsStarted,
-            sessionIds: result.startedSessionIds
-          });
-        }
-      }).catch(error => {
-        logger.error('SYSTEM', 'Auto-recovery of pending queues failed', {}, error as Error);
-      });
-    } catch (error) {
-      logger.error('SYSTEM', 'Background initialization failed', {}, error as Error);
-      throw error;
     }
+
+    // Auto-recover orphaned queues and run the no-queue stale-active janitor
+    // (fire-and-forget with error logging).
+    this.processPendingQueues(50).then(result => {
+      if (result.sessionsStarted > 0) {
+        logger.info('SYSTEM', `Auto-recovered ${result.sessionsStarted} sessions with pending work`, {
+          totalPending: result.totalPendingSessions,
+          started: result.sessionsStarted,
+          sessionIds: result.startedSessionIds
+        });
+      }
+    }).catch(error => {
+      logger.error('SYSTEM', 'Auto-recovery of pending queues failed', {}, error as Error);
+    });
   }
 
   /**
@@ -827,6 +847,18 @@ export class WorkerService {
           // Fall through to pending-work restart below
         }
         if (pendingCount > 0) {
+          const sessionAgeMs = this.getPersistedSessionAgeMs(session.sessionDbId, session.startTime);
+          if (sessionAgeMs > WorkerService.MAX_RECOVERY_SESSION_AGE_MS) {
+            logger.warn('SYSTEM', 'Session exceeded wall-clock age limit with pending work; terminating instead of restarting', {
+              sessionId: session.sessionDbId,
+              pendingCount,
+              ageHours: Math.round(sessionAgeMs / 3_600_000 * 10) / 10,
+              limitHours: WorkerService.MAX_RECOVERY_SESSION_AGE_MS / 3_600_000
+            });
+            this.terminateSession(session.sessionDbId, 'max_wall_clock_age_exceeded');
+            return;
+          }
+
           // Windowed restart guard: only blocks tight-loop restarts, not spread-out ones (#2053)
           if (!session.restartGuard) session.restartGuard = new RestartGuard();
           const restartAllowed = session.restartGuard.recordRestart();
@@ -1031,6 +1063,84 @@ export class WorkerService {
     }
   }
 
+  private getPersistedSessionAgeMs(sessionDbId: number, fallbackStartTime: number): number {
+    const row = this.dbManager.getSessionStore().db
+      .prepare('SELECT started_at_epoch FROM sdk_sessions WHERE id = ? LIMIT 1')
+      .get(sessionDbId) as { started_at_epoch: number } | undefined;
+    const startedAtEpoch = row?.started_at_epoch ?? fallbackStartTime;
+    return Date.now() - startedAtEpoch;
+  }
+
+  private cleanupStaleActiveSessionsWithoutWork(): number {
+    const sessionStore = this.dbManager.getSessionStore();
+    const staleThreshold = Date.now() - WorkerService.STALE_ACTIVE_NO_QUEUE_SESSION_AGE_MS;
+    const candidates = sessionStore.db.prepare(`
+      SELECT s.id
+      FROM sdk_sessions s
+      WHERE s.status = 'active'
+        AND s.started_at_epoch < ?
+        AND NOT EXISTS (
+          SELECT 1
+          FROM pending_messages pm
+          WHERE pm.session_db_id = s.id
+            AND pm.status IN ('pending', 'processing')
+        )
+    `).all(staleThreshold) as { id: number }[];
+
+    const staleIdsWithoutGenerator = candidates
+      .map(row => row.id)
+      .filter(id => !this.sessionManager.getSession(id));
+
+    if (staleIdsWithoutGenerator.length === 0) {
+      return 0;
+    }
+
+    const placeholders = staleIdsWithoutGenerator.map(() => '?').join(',');
+    const result = sessionStore.db.prepare(`
+      UPDATE sdk_sessions
+      SET status = 'failed', completed_at_epoch = ?
+      WHERE id IN (${placeholders}) AND status = 'active'
+    `).run(Date.now(), ...staleIdsWithoutGenerator);
+
+    return result.changes;
+  }
+
+  private cleanupPendingMessagesWithoutActiveOwner(): number {
+    const sessionStore = this.dbManager.getSessionStore();
+    const invalidOwnerSessions = sessionStore.db.prepare(`
+      SELECT DISTINCT pm.session_db_id
+      FROM pending_messages pm
+      LEFT JOIN sdk_sessions s ON s.id = pm.session_db_id
+      WHERE pm.status IN ('pending', 'processing')
+        AND (s.id IS NULL OR s.status != 'active')
+    `).all() as { session_db_id: number }[];
+
+    if (invalidOwnerSessions.length === 0) {
+      return 0;
+    }
+
+    const result = sessionStore.db.prepare(`
+      UPDATE pending_messages
+      SET status = 'failed', failed_at_epoch = ?
+      WHERE status IN ('pending', 'processing')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sdk_sessions s
+          WHERE s.id = pending_messages.session_db_id
+            AND s.status = 'active'
+        )
+    `).run(Date.now());
+
+    if (result.changes > 0) {
+      logger.info('SYSTEM', 'Marked pending messages without active owner as failed', {
+        sessionsSkipped: invalidOwnerSessions.length,
+        messagesFailed: result.changes
+      });
+    }
+
+    return invalidOwnerSessions.length;
+  }
+
   /**
    * Process pending session queues
    */
@@ -1044,53 +1154,69 @@ export class WorkerService {
     const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
     const sessionStore = this.dbManager.getSessionStore();
 
+    const invalidOwnerSkippedSessions = this.cleanupPendingMessagesWithoutActiveOwner();
+    const cleanedNoQueueSessions = this.cleanupStaleActiveSessionsWithoutWork();
+    if (cleanedNoQueueSessions > 0) {
+      logger.info('SYSTEM', `Marked ${cleanedNoQueueSessions} stale active sessions without active queue as failed`);
+    }
+
     // Clean up stale 'active' sessions before processing
-    // Sessions older than 6 hours without activity are likely orphaned
-    const STALE_SESSION_THRESHOLD_MS = 6 * 60 * 60 * 1000;
-    const staleThreshold = Date.now() - STALE_SESSION_THRESHOLD_MS;
+    // Sessions older than the wall-clock recovery limit are likely orphaned and
+    // must not be revived by startup recovery or pending-work restarts.
+    const staleThreshold = Date.now() - WorkerService.MAX_RECOVERY_SESSION_AGE_MS;
 
     const staleSessionIds = sessionStore.db.prepare(`
-      SELECT id FROM sdk_sessions
-      WHERE status = 'active' AND started_at_epoch < ?
+      SELECT DISTINCT s.id
+      FROM sdk_sessions s
+      JOIN pending_messages pm ON pm.session_db_id = s.id
+      WHERE s.status = 'active'
+        AND s.started_at_epoch < ?
+        AND pm.status IN ('pending', 'processing')
     `).all(staleThreshold) as { id: number }[];
 
     if (staleSessionIds.length > 0) {
-      const ids = staleSessionIds.map(r => r.id);
-      const placeholders = ids.map(() => '?').join(',');
-      const now = Date.now();
+      const ids = staleSessionIds
+        .map(r => r.id)
+        .filter(id => !this.sessionManager.getSession(id)?.generatorPromise);
+      if (ids.length === 0) {
+        logger.info('SYSTEM', 'Skipped stale active queue cleanup because all candidates still have in-memory generator ownership');
+      } else {
+        const placeholders = ids.map(() => '?').join(',');
+        const now = Date.now();
 
-      try {
-        sessionStore.db.prepare(`
-          UPDATE sdk_sessions
-          SET status = 'failed', completed_at_epoch = ?
-          WHERE id IN (${placeholders})
-        `).run(now, ...ids);
-        logger.info('SYSTEM', `Marked ${ids.length} stale sessions as failed`);
-      } catch (error) {
-        // [ANTI-PATTERN IGNORED]: Stale session cleanup is best-effort; pending queue processing below must still proceed
-        if (error instanceof Error) {
-          logger.error('WORKER', 'Failed to mark stale sessions as failed', { staleCount: ids.length }, error);
-        } else {
-          logger.error('WORKER', 'Failed to mark stale sessions as failed with non-Error', { staleCount: ids.length }, new Error(String(error)));
+        try {
+          sessionStore.db.prepare(`
+            UPDATE sdk_sessions
+            SET status = 'failed', completed_at_epoch = ?
+            WHERE id IN (${placeholders})
+          `).run(now, ...ids);
+          logger.info('SYSTEM', `Marked ${ids.length} stale sessions as failed`);
+        } catch (error) {
+          // [ANTI-PATTERN IGNORED]: Stale session cleanup is best-effort; pending queue processing below must still proceed
+          if (error instanceof Error) {
+            logger.error('WORKER', 'Failed to mark stale sessions as failed', { staleCount: ids.length }, error);
+          } else {
+            logger.error('WORKER', 'Failed to mark stale sessions as failed with non-Error', { staleCount: ids.length }, new Error(String(error)));
+          }
         }
-      }
 
-      try {
-        const msgResult = sessionStore.db.prepare(`
-          UPDATE pending_messages
-          SET status = 'failed', failed_at_epoch = ?
-          WHERE status = 'pending'
-          AND session_db_id IN (${placeholders})
-        `).run(now, ...ids);
-        if (msgResult.changes > 0) {
-          logger.info('SYSTEM', `Marked ${msgResult.changes} pending messages from stale sessions as failed`);
-        }
-      } catch (error) {
-        // [ANTI-PATTERN IGNORED]: Pending message cleanup is best-effort; queue processing below must still proceed
-        if (error instanceof Error) {
-          logger.error('WORKER', 'Failed to clean up stale pending messages', { staleCount: ids.length }, error);
-        } else {
-          logger.error('WORKER', 'Failed to clean up stale pending messages with non-Error', { staleCount: ids.length }, new Error(String(error)));
+        try {
+          const msgResult = sessionStore.db.prepare(`
+            UPDATE pending_messages
+            SET status = 'failed', failed_at_epoch = ?
+            WHERE status IN ('pending', 'processing')
+            AND session_db_id IN (${placeholders})
+          `).run(now, ...ids);
+          if (msgResult.changes > 0) {
+            logger.info('SYSTEM', `Marked ${msgResult.changes} active pending messages from stale sessions as failed`);
+          }
+        } catch (error) {
+          // [ANTI-PATTERN IGNORED]: Pending message cleanup is best-effort; queue processing below must still proceed
+          if (error instanceof Error) {
+            logger.error('WORKER', 'Failed to clean up stale pending messages', { staleCount: ids.length }, error);
+          } else {
+            logger.error('WORKER', 'Failed to clean up stale pending messages with non-Error', { staleCount: ids.length }, new Error(String(error)));
+          }
         }
       }
     }
@@ -1100,7 +1226,7 @@ export class WorkerService {
     const result = {
       totalPendingSessions: orphanedSessionIds.length,
       sessionsStarted: 0,
-      sessionsSkipped: 0,
+      sessionsSkipped: invalidOwnerSkippedSessions,
       startedSessionIds: [] as number[]
     };
 
@@ -1110,6 +1236,50 @@ export class WorkerService {
 
     for (const sessionDbId of orphanedSessionIds) {
       if (result.sessionsStarted >= sessionLimit) break;
+
+      const sessionRecord = sessionStore.db.prepare(`
+        SELECT status, started_at_epoch FROM sdk_sessions WHERE id = ? LIMIT 1
+      `).get(sessionDbId) as { status: string; started_at_epoch: number } | undefined;
+
+      if (!sessionRecord) {
+        const abandoned = pendingStore.markAllSessionMessagesAbandoned(sessionDbId);
+        logger.warn('SYSTEM', 'Skipping pending queue for missing session record', {
+          sessionId: sessionDbId,
+          abandonedMessages: abandoned
+        });
+        result.sessionsSkipped++;
+        continue;
+      }
+
+      if (sessionRecord.status !== 'active') {
+        const abandoned = pendingStore.markAllSessionMessagesAbandoned(sessionDbId);
+        logger.warn('SYSTEM', 'Skipping pending queue for non-active session', {
+          sessionId: sessionDbId,
+          status: sessionRecord.status,
+          abandonedMessages: abandoned
+        });
+        result.sessionsSkipped++;
+        continue;
+      }
+
+      const sessionAgeMs = Date.now() - sessionRecord.started_at_epoch;
+      if (sessionAgeMs > WorkerService.MAX_RECOVERY_SESSION_AGE_MS) {
+        const now = Date.now();
+        sessionStore.db.prepare(`
+          UPDATE sdk_sessions
+          SET status = 'failed', completed_at_epoch = ?
+          WHERE id = ? AND status = 'active'
+        `).run(now, sessionDbId);
+        const abandoned = pendingStore.markAllSessionMessagesAbandoned(sessionDbId);
+        logger.warn('SYSTEM', 'Skipping stale pending queue that exceeded wall-clock recovery limit', {
+          sessionId: sessionDbId,
+          ageHours: Math.round(sessionAgeMs / 3_600_000 * 10) / 10,
+          limitHours: WorkerService.MAX_RECOVERY_SESSION_AGE_MS / 3_600_000,
+          abandonedMessages: abandoned
+        });
+        result.sessionsSkipped++;
+        continue;
+      }
 
       const existingSession = this.sessionManager.getSession(sessionDbId);
       if (existingSession?.generatorPromise) {
