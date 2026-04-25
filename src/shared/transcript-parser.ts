@@ -2,6 +2,89 @@ import { readFileSync, existsSync } from 'fs';
 import { logger } from '../utils/logger.js';
 import { SYSTEM_REMINDER_REGEX } from '../utils/tag-stripping.js';
 
+const SUBAGENT_NOTIFICATION_REGEX = /<subagent_notification>\s*([\s\S]*?)\s*<\/subagent_notification>/g;
+
+export type SubagentTerminalStatus = 'completed' | 'failed' | 'reported';
+
+export interface ParsedSubagentNotification {
+  sourceTag: 'subagent_notification';
+  agentPath: string;
+  childSessionId: string;
+  terminalStatus: SubagentTerminalStatus;
+  terminalMessage: string;
+  rawStatus: unknown;
+  parityClaim: 'codex_host_max_degraded_receipt_not_subagentstop';
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function statusEntry(status: unknown): { terminalStatus: SubagentTerminalStatus; terminalMessage: string } {
+  if (!isRecord(status)) {
+    return { terminalStatus: 'reported', terminalMessage: '' };
+  }
+
+  const completed = status.completed;
+  if (typeof completed === 'string') {
+    return { terminalStatus: 'completed', terminalMessage: completed };
+  }
+
+  const failed = status.failed;
+  if (typeof failed === 'string') {
+    return { terminalStatus: 'failed', terminalMessage: failed };
+  }
+
+  const reported = status.reported;
+  if (typeof reported === 'string') {
+    return { terminalStatus: 'reported', terminalMessage: reported };
+  }
+
+  return { terminalStatus: 'reported', terminalMessage: JSON.stringify(status) };
+}
+
+function parseSubagentNotificationBody(body: string): ParsedSubagentNotification | null {
+  try {
+    const parsed = JSON.parse(body);
+    if (!isRecord(parsed) || typeof parsed.agent_path !== 'string' || !parsed.agent_path.trim()) {
+      return null;
+    }
+
+    const { terminalStatus, terminalMessage } = statusEntry(parsed.status);
+    const agentPath = parsed.agent_path.trim();
+    return {
+      sourceTag: 'subagent_notification',
+      agentPath,
+      childSessionId: agentPath,
+      terminalStatus,
+      terminalMessage,
+      rawStatus: parsed.status,
+      parityClaim: 'codex_host_max_degraded_receipt_not_subagentstop'
+    };
+  } catch (error: unknown) {
+    logger.debug(
+      'PARSER',
+      'Skipping malformed subagent notification body',
+      { length: body.length },
+      error instanceof Error ? error : undefined
+    );
+    return null;
+  }
+}
+
+export function parseSubagentNotifications(text: string): ParsedSubagentNotification[] {
+  if (!text.includes('<subagent_notification>')) return [];
+
+  const receipts: ParsedSubagentNotification[] = [];
+  for (const match of text.matchAll(SUBAGENT_NOTIFICATION_REGEX)) {
+    const body = match[1]?.trim();
+    if (!body) continue;
+    const receipt = parseSubagentNotificationBody(body);
+    if (receipt) receipts.push(receipt);
+  }
+  return receipts;
+}
+
 /**
  * Detect whether a transcript file is in Gemini CLI JSON document format.
  *

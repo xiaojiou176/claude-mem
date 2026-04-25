@@ -1,6 +1,17 @@
 /**
  * Context Types - Shared types for context generation module
  */
+import type {
+  CanonicalEvent,
+  CanonicalEventSource,
+  CanonicalReplayMetadata,
+} from '../codex-events/CanonicalEvent.js';
+
+export const CONTEXT_CANONICAL_EVENT_FIELDS = [
+  'canonicalEvent',
+  'canonicalSource',
+  'canonicalReplay',
+] as const;
 
 /**
  * Input parameters for context generation
@@ -15,6 +26,10 @@ export interface ContextInput {
   projects?: string[];
   /** When true, return ALL observations with no limit */
   full?: boolean;
+  /** Phase 2 canonical event bus hook point; no ordering policy is applied here. */
+  canonicalEvent?: CanonicalEvent;
+  canonicalSource?: CanonicalEventSource;
+  canonicalReplay?: CanonicalReplayMetadata;
   [key: string]: any;
 }
 

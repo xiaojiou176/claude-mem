@@ -1,17 +1,23 @@
-import path from 'path';
-import { sessionInitHandler } from '../../cli/handlers/session-init.js';
-import { observationHandler } from '../../cli/handlers/observation.js';
-import { fileEditHandler } from '../../cli/handlers/file-edit.js';
-import { sessionCompleteHandler } from '../../cli/handlers/session-complete.js';
-import { ensureWorkerRunning, workerHttpRequest } from '../../shared/worker-utils.js';
-import { DATA_DIR } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
+import { resolve } from 'path';
 import { getProjectContext } from '../../utils/project-name.js';
-import { writeAgentsMd } from '../../utils/agents-md-utils.js';
 import { resolveFieldSpec, resolveFields, matchesRule } from './field-utils.js';
-import { expandHomePath } from './config.js';
-import type { TranscriptSchema, WatchTarget, SchemaEvent } from './types.js';
+import type {
+  EventAction,
+  TranscriptCanonicalAudit,
+  TranscriptCanonicalEvent,
+  TranscriptCanonicalSession,
+  TranscriptCanonicalSource,
+  TranscriptReplaySemantics,
+  TranscriptSchema,
+  WatchTarget,
+  SchemaEvent
+} from './types.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { parseSubagentNotifications } from '../../shared/transcript-parser.js';
+import { resolveAgentsMdProjectionTarget } from '../../utils/agents-md-utils.js';
+import { CANONICAL_EVENT_SCHEMA_VERSION } from '../codex-events/CanonicalEvent.js';
+import { projectSubagentReceipts } from '../codex-events/SubagentReceiptProjector.js';
 
 interface SessionState {
   sessionId: string;
@@ -30,6 +36,26 @@ interface PendingTool {
   response?: unknown;
 }
 
+const TRANSCRIPT_EVENT_METADATA = {
+  sourceRail: 'transcript',
+  railRole: 'fallback_replay_audit',
+  canonicalPriority: 'secondary'
+} as const;
+
+const TRANSCRIPT_EVENT_SOURCE: TranscriptCanonicalSource = {
+  rail: TRANSCRIPT_EVENT_METADATA.sourceRail,
+  role: TRANSCRIPT_EVENT_METADATA.railRole,
+  priority: TRANSCRIPT_EVENT_METADATA.canonicalPriority,
+  primaryRail: 'hooks'
+};
+
+const TRANSCRIPT_REPLAY_SEMANTICS: TranscriptReplaySemantics = {
+  mode: 'source_adapter',
+  recovery: 'fill_missing_events_only',
+  overwritePolicy: 'never_overwrite_hook_primary',
+  lateArrivalPolicy: 'preserve_existing_order'
+};
+
 export class TranscriptEventProcessor {
   private sessions = new Map<string, SessionState>();
 
@@ -38,11 +64,13 @@ export class TranscriptEventProcessor {
     watch: WatchTarget,
     schema: TranscriptSchema,
     sessionIdOverride?: string | null
-  ): Promise<void> {
+  ): Promise<TranscriptCanonicalEvent[]> {
+    const canonicalEvents: TranscriptCanonicalEvent[] = [];
     for (const event of schema.events) {
       if (!matchesRule(entry, event.match, schema)) continue;
-      await this.handleEvent(entry, watch, schema, event, sessionIdOverride ?? undefined);
+      canonicalEvents.push(...this.handleEvent(entry, watch, schema, event, sessionIdOverride ?? undefined));
     }
+    return canonicalEvents;
   }
 
   private getSessionKey(watch: WatchTarget, sessionId: string): string {
@@ -90,8 +118,9 @@ export class TranscriptEventProcessor {
     const fieldSpec = event.fields?.cwd ?? (schema.cwdPath ? { path: schema.cwdPath } : undefined);
     const resolved = resolveFieldSpec(fieldSpec, entry, ctx);
     if (typeof resolved === 'string' && resolved.trim()) return resolved;
+    if (session.cwd) return session.cwd;
     if (watch.workspace) return watch.workspace;
-    return session.cwd;
+    return undefined;
   }
 
   private resolveProject(
@@ -106,21 +135,28 @@ export class TranscriptEventProcessor {
     const resolved = resolveFieldSpec(fieldSpec, entry, ctx);
     if (typeof resolved === 'string' && resolved.trim()) return resolved;
     if (watch.project) return watch.project;
+    if (session.cwd) {
+      const cwdContext = getProjectContext(session.cwd);
+      if (!watch.workspace || (cwdContext.scopeRoot && resolve(cwdContext.scopeRoot) !== resolve(session.cwd))) {
+        return cwdContext.primary;
+      }
+    }
+    if (watch.workspace) return getProjectContext(watch.workspace).primary;
     if (session.cwd) return getProjectContext(session.cwd).primary;
     return session.project;
   }
 
-  private async handleEvent(
+  private handleEvent(
     entry: unknown,
     watch: WatchTarget,
     schema: TranscriptSchema,
     event: SchemaEvent,
     sessionIdOverride?: string
-  ): Promise<void> {
+  ): TranscriptCanonicalEvent[] {
     const sessionId = this.resolveSessionId(entry, watch, schema, event, sessionIdOverride);
     if (!sessionId) {
-      logger.debug('TRANSCRIPT', 'Skipping event without sessionId', { event: event.name, watch: watch.name });
-      return;
+      logger.debug('WORKER', 'Skipping transcript event without sessionId', { event: event.name, watch: watch.name });
+      return [];
     }
 
     const session = this.getOrCreateSession(watch, sessionId);
@@ -129,43 +165,58 @@ export class TranscriptEventProcessor {
     const project = this.resolveProject(entry, watch, schema, event, session);
     if (project) session.project = project;
 
-    const fields = resolveFields(event.fields, entry, { watch, schema, session });
+    const fields = resolveFields(event.fields, entry, { watch, schema, session: session as unknown as Record<string, unknown> });
+    const canonicalEvents: TranscriptCanonicalEvent[] = [];
+    const subagentReceiptEvents = this.handleSubagentNotification(watch, session, fields);
+    if (subagentReceiptEvents.length > 0) {
+      return subagentReceiptEvents;
+    }
 
     switch (event.action) {
-      case 'session_context':
+      case 'session_context': {
         this.applySessionContext(session, fields);
+        canonicalEvents.push(this.createCanonicalEvent(watch, schema, event, session, 'session_context', {
+          cwd: session.cwd,
+          project: session.project
+        }));
         break;
+      }
       case 'session_init':
-        await this.handleSessionInit(session, fields);
-        if (watch.context?.updateOn?.includes('session_start')) {
-          await this.updateContext(session, watch);
-        }
+        canonicalEvents.push(this.handleSessionInit(watch, schema, event, session, fields));
         break;
       case 'user_message':
         if (typeof fields.message === 'string') session.lastUserMessage = fields.message;
         if (typeof fields.prompt === 'string') session.lastUserMessage = fields.prompt;
+        canonicalEvents.push(this.createCanonicalEvent(watch, schema, event, session, 'user_message', {
+          message: session.lastUserMessage
+        }));
         break;
       case 'assistant_message':
         if (typeof fields.message === 'string') session.lastAssistantMessage = fields.message;
+        canonicalEvents.push(this.createCanonicalEvent(watch, schema, event, session, 'assistant_message', {
+          message: session.lastAssistantMessage
+        }));
         break;
       case 'tool_use':
-        await this.handleToolUse(session, fields);
+        canonicalEvents.push(...this.handleToolUse(watch, schema, event, session, fields));
         break;
       case 'tool_result':
-        await this.handleToolResult(session, fields);
+        canonicalEvents.push(...this.handleToolResult(watch, schema, event, session, fields));
         break;
       case 'observation':
-        await this.sendObservation(session, fields);
+        canonicalEvents.push(this.createCanonicalEvent(watch, schema, event, session, 'observation', this.normalizeToolPayload(fields)));
         break;
       case 'file_edit':
-        await this.sendFileEdit(session, fields);
+        canonicalEvents.push(this.createFileEditEvent(watch, schema, event, session, fields));
         break;
       case 'session_end':
-        await this.handleSessionEnd(session, watch);
+        canonicalEvents.push(this.handleSessionEnd(watch, schema, event, session));
         break;
       default:
         break;
     }
+
+    return canonicalEvents;
   }
 
   private applySessionContext(session: SessionState, fields: Record<string, unknown>): void {
@@ -175,28 +226,68 @@ export class TranscriptEventProcessor {
     if (project) session.project = project;
   }
 
-  private async handleSessionInit(session: SessionState, fields: Record<string, unknown>): Promise<void> {
+  private handleSubagentNotification(
+    watch: WatchTarget,
+    session: SessionState,
+    fields: Record<string, unknown>
+  ): TranscriptCanonicalEvent[] {
+    const message = typeof fields.message === 'string' ? fields.message : undefined;
+    if (!message) return [];
+
+    const receipts = parseSubagentNotifications(message);
+    if (receipts.length === 0) return [];
+
+    const parentSession = {
+      id: session.sessionId,
+      platformSource: session.platformSource,
+      cwd: session.cwd,
+      project: session.project,
+      transcriptPath: watch.path
+    };
+    return projectSubagentReceipts({ parentSession, receipts }) as unknown as TranscriptCanonicalEvent[];
+  }
+
+  private handleSessionInit(
+    watch: WatchTarget,
+    schema: TranscriptSchema,
+    event: SchemaEvent,
+    session: SessionState,
+    fields: Record<string, unknown>
+  ): TranscriptCanonicalEvent {
     const prompt = typeof fields.prompt === 'string' ? fields.prompt : '';
-    const cwd = session.cwd ?? process.cwd();
     if (prompt) {
       session.lastUserMessage = prompt;
     }
 
-    await sessionInitHandler.execute({
-      sessionId: session.sessionId,
-      cwd,
+    const contextProjection = this.createContextProjection(watch, session, 'session_start');
+    return this.createCanonicalEvent(watch, schema, event, session, 'session_init', {
       prompt,
-      platform: session.platformSource
+      contextUpdateRequested: Boolean(contextProjection),
+      contextProjection
     });
   }
 
-  private async handleToolUse(session: SessionState, fields: Record<string, unknown>): Promise<void> {
+  private handleToolUse(
+    watch: WatchTarget,
+    schema: TranscriptSchema,
+    event: SchemaEvent,
+    session: SessionState,
+    fields: Record<string, unknown>
+  ): TranscriptCanonicalEvent[] {
     const toolId = typeof fields.toolId === 'string' ? fields.toolId : undefined;
     const toolName = typeof fields.toolName === 'string' ? fields.toolName : undefined;
     const toolInput = this.maybeParseJson(fields.toolInput);
     const toolResponse = this.maybeParseJson(fields.toolResponse);
 
     const pending: PendingTool = { id: toolId, name: toolName, input: toolInput, response: toolResponse };
+    const canonicalEvents: TranscriptCanonicalEvent[] = [
+      this.createCanonicalEvent(watch, schema, event, session, 'tool_use', this.normalizeToolPayload({
+        toolId,
+        toolName,
+        toolInput,
+        toolResponse
+      }))
+    ];
 
     if (toolId) {
       session.pendingTools.set(toolId, { name: pending.name, input: pending.input });
@@ -205,23 +296,33 @@ export class TranscriptEventProcessor {
     if (toolName === 'apply_patch' && typeof toolInput === 'string') {
       const files = this.parseApplyPatchFiles(toolInput);
       for (const filePath of files) {
-        await this.sendFileEdit(session, {
+        canonicalEvents.push(this.createFileEditEvent(watch, schema, event, session, {
+          toolId,
+          toolName,
           filePath,
           edits: [{ type: 'apply_patch', patch: toolInput }]
-        });
+        }));
       }
     }
 
     if (toolResponse !== undefined && toolName) {
-      await this.sendObservation(session, {
+      canonicalEvents.push(this.createCanonicalEvent(watch, schema, event, session, 'observation', this.normalizeToolPayload({
         toolName,
         toolInput,
         toolResponse
-      });
+      })));
     }
+
+    return canonicalEvents;
   }
 
-  private async handleToolResult(session: SessionState, fields: Record<string, unknown>): Promise<void> {
+  private handleToolResult(
+    watch: WatchTarget,
+    schema: TranscriptSchema,
+    event: SchemaEvent,
+    session: SessionState,
+    fields: Record<string, unknown>
+  ): TranscriptCanonicalEvent[] {
     const toolId = typeof fields.toolId === 'string' ? fields.toolId : undefined;
     const toolName = typeof fields.toolName === 'string' ? fields.toolName : undefined;
     const toolResponse = this.maybeParseJson(fields.toolResponse);
@@ -236,39 +337,39 @@ export class TranscriptEventProcessor {
       session.pendingTools.delete(toolId);
     }
 
-    if (name) {
-      await this.sendObservation(session, {
+    if (!name) return [];
+
+    return [
+      this.createCanonicalEvent(watch, schema, event, session, 'tool_result', this.normalizeToolPayload({
+        toolId,
         toolName: name,
         toolInput,
         toolResponse
-      });
-    }
+      }))
+    ];
   }
 
-  private async sendObservation(session: SessionState, fields: Record<string, unknown>): Promise<void> {
-    const toolName = typeof fields.toolName === 'string' ? fields.toolName : undefined;
-    if (!toolName) return;
-
-    await observationHandler.execute({
-      sessionId: session.sessionId,
-      cwd: session.cwd ?? process.cwd(),
-      toolName,
+  private normalizeToolPayload(fields: Record<string, unknown>): Record<string, unknown> {
+    return {
+      ...fields,
       toolInput: this.maybeParseJson(fields.toolInput),
-      toolResponse: this.maybeParseJson(fields.toolResponse),
-      platform: session.platformSource
-    });
+      toolResponse: this.maybeParseJson(fields.toolResponse)
+    };
   }
 
-  private async sendFileEdit(session: SessionState, fields: Record<string, unknown>): Promise<void> {
+  private createFileEditEvent(
+    watch: WatchTarget,
+    schema: TranscriptSchema,
+    event: SchemaEvent,
+    session: SessionState,
+    fields: Record<string, unknown>
+  ): TranscriptCanonicalEvent {
     const filePath = typeof fields.filePath === 'string' ? fields.filePath : undefined;
-    if (!filePath) return;
-
-    await fileEditHandler.execute({
-      sessionId: session.sessionId,
-      cwd: session.cwd ?? process.cwd(),
+    return this.createCanonicalEvent(watch, schema, event, session, 'file_edit', {
+      toolId: fields.toolId,
+      toolName: fields.toolName,
       filePath,
-      edits: Array.isArray(fields.edits) ? fields.edits : undefined,
-      platform: session.platformSource
+      edits: Array.isArray(fields.edits) ? fields.edits : undefined
     });
   }
 
@@ -306,88 +407,135 @@ export class TranscriptEventProcessor {
     return Array.from(new Set(files));
   }
 
-  private async handleSessionEnd(session: SessionState, watch: WatchTarget): Promise<void> {
-    await this.queueSummary(session);
-    await sessionCompleteHandler.execute({
-      sessionId: session.sessionId,
-      cwd: session.cwd ?? process.cwd(),
-      platform: session.platformSource
+  private handleSessionEnd(
+    watch: WatchTarget,
+    schema: TranscriptSchema,
+    event: SchemaEvent,
+    session: SessionState
+  ): TranscriptCanonicalEvent {
+    const contextProjection = this.createContextProjection(watch, session, 'session_end');
+    const canonicalEvent = this.createCanonicalEvent(watch, schema, event, session, 'session_end', {
+      lastAssistantMessage: session.lastAssistantMessage ?? '',
+      contextUpdateRequested: Boolean(contextProjection),
+      contextProjection
     });
-    await this.updateContext(session, watch);
     session.pendingTools.clear();
     const key = this.getSessionKey(watch, session.sessionId);
     this.sessions.delete(key);
+    return canonicalEvent;
   }
 
-  private async queueSummary(session: SessionState): Promise<void> {
-    const workerReady = await ensureWorkerRunning();
-    if (!workerReady) return;
+  private createContextProjection(
+    watch: WatchTarget,
+    session: SessionState,
+    trigger: 'session_start' | 'session_end'
+  ): Record<string, unknown> | undefined {
+    if (watch.context?.mode !== 'agents') return undefined;
+    if (watch.context.updateOn?.includes(trigger) !== true) return undefined;
 
-    const lastAssistantMessage = session.lastAssistantMessage ?? '';
-    const requestBody = JSON.stringify({
-      contentSessionId: session.sessionId,
-      last_assistant_message: lastAssistantMessage,
-      platformSource: session.platformSource
+    const target = resolveAgentsMdProjectionTarget({
+      contextPath: watch.context.path,
+      workspace: watch.workspace,
+      cwd: session.cwd
     });
+    if (!target) return undefined;
 
-    try {
-      await workerHttpRequest('/api/sessions/summarize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: requestBody
-      });
-    } catch (error: unknown) {
-      logger.warn('TRANSCRIPT', 'Summary request failed', {
-        error: error instanceof Error ? error.message : String(error)
-      });
+    const projection: Record<string, unknown> = {
+      mode: 'agents',
+      role: 'projection_sink_not_storage',
+      trigger,
+      targetPath: target.targetPath,
+      targetScope: target.targetScope,
+      precedence: target.precedence,
+      codexScopeNote: 'root/nested AGENTS accumulate; same-directory AGENTS.override.md masks AGENTS.md'
+    };
+
+    if (watch.workspace && session.cwd && resolve(watch.workspace) !== resolve(session.cwd)) {
+      projection.cwdDrift = {
+        workspace: watch.workspace,
+        observedCwd: session.cwd,
+        status: target.cwdDriftStatus
+      };
     }
+
+    return projection;
   }
 
-  private async updateContext(session: SessionState, watch: WatchTarget): Promise<void> {
-    if (!watch.context) return;
-    if (watch.context.mode !== 'agents') return;
+  private createCanonicalEvent(
+    watch: WatchTarget,
+    schema: TranscriptSchema,
+    event: SchemaEvent,
+    session: SessionState,
+    type: EventAction,
+    payload: Record<string, unknown>
+  ): TranscriptCanonicalEvent {
+    const cleanedPayload = this.dropUndefined(payload);
+    const idempotencyKey = this.createIdempotencyKey(watch, session, type, cleanedPayload);
+    const canonicalSession: TranscriptCanonicalSession = {
+      id: session.sessionId,
+      platformSource: session.platformSource
+    };
+    if (session.cwd) canonicalSession.cwd = session.cwd;
+    if (session.project) canonicalSession.project = session.project;
 
-    const workerReady = await ensureWorkerRunning();
-    if (!workerReady) return;
+    const audit: TranscriptCanonicalAudit = {
+      watchName: watch.name,
+      schemaName: schema.name,
+      eventName: event.name,
+      observedAt: new Date().toISOString()
+    };
+    if (schema.version) audit.schemaVersion = schema.version;
 
-    const cwd = session.cwd ?? watch.workspace;
-    if (!cwd) return;
+    return {
+      schemaVersion: CANONICAL_EVENT_SCHEMA_VERSION,
+      id: idempotencyKey,
+      idempotencyKey,
+      type,
+      materialization: 'deferred',
+      source: this.createTranscriptSource(watch),
+      replay: TRANSCRIPT_REPLAY_SEMANTICS,
+      session: canonicalSession,
+      payload: cleanedPayload,
+      observedAt: audit.observedAt,
+      audit,
+      metadata: {
+        observedFrom: 'transcript-jsonl',
+        replayRole: TRANSCRIPT_EVENT_METADATA.railRole,
+        watchName: watch.name,
+        schemaName: schema.name,
+        schemaEventName: event.name
+      }
+    };
+  }
 
-    const context = getProjectContext(cwd);
-    const projectsParam = context.allProjects.join(',');
+  private createTranscriptSource(watch: WatchTarget): TranscriptCanonicalSource {
+    return {
+      ...TRANSCRIPT_EVENT_SOURCE,
+      adapter: `${watch.name}-transcript`
+    };
+  }
 
-    const contextUrl = `/api/context/inject?projects=${encodeURIComponent(projectsParam)}`;
-    const agentsPath = expandHomePath(watch.context.path ?? `${cwd}/AGENTS.md`);
-
-    // Validate resolved path stays within allowed directories (#1934)
-    const resolvedAgentsPath = path.resolve(agentsPath);
-    const allowedRoots = [path.resolve(cwd), path.resolve(DATA_DIR)];
-    const isPathSafe = allowedRoots.some(root => resolvedAgentsPath.startsWith(root + path.sep) || resolvedAgentsPath === root);
-    if (!isPathSafe) {
-      logger.warn('SECURITY', 'Rejected path traversal attempt in watch.context.path', {
-        original: watch.context.path,
-        resolved: resolvedAgentsPath,
-        allowedRoots
-      });
-      return;
+  private createIdempotencyKey(
+    watch: WatchTarget,
+    session: SessionState,
+    type: EventAction,
+    payload: Record<string, unknown>
+  ): string {
+    const base = `${watch.name}:${session.sessionId}:${type}`;
+    const toolId = typeof payload.toolId === 'string' ? payload.toolId : undefined;
+    const filePath = typeof payload.filePath === 'string' ? payload.filePath : undefined;
+    if (type === 'file_edit' && filePath) {
+      return toolId ? `${base}:${filePath}:${toolId}` : `${base}:${filePath}`;
     }
+    if (toolId) return `${base}:${toolId}`;
+    return base;
+  }
 
-    let response: Awaited<ReturnType<typeof workerHttpRequest>>;
-    try {
-      response = await workerHttpRequest(contextUrl);
-    } catch (error: unknown) {
-      logger.warn('TRANSCRIPT', 'Failed to fetch AGENTS.md context', {
-        error: error instanceof Error ? error.message : String(error)
-      });
-      return;
+  private dropUndefined<T extends Record<string, unknown>>(input: T): Record<string, unknown> {
+    const output: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(input)) {
+      if (value !== undefined) output[key] = value;
     }
-
-    if (!response.ok) return;
-
-    const content = (await response.text()).trim();
-    if (!content) return;
-
-    writeAgentsMd(agentsPath, content);
-    logger.debug('TRANSCRIPT', 'Updated AGENTS.md context', { agentsPath, watch: watch.name });
+    return output;
   }
 }

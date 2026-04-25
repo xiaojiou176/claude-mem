@@ -6,10 +6,16 @@ import type { TranscriptSchema, TranscriptWatchConfig } from './types.js';
 export const DEFAULT_CONFIG_PATH = join(homedir(), '.claude-mem', 'transcript-watch.json');
 export const DEFAULT_STATE_PATH = join(homedir(), '.claude-mem', 'transcript-watch-state.json');
 
+export const CODEX_TRANSCRIPT_ROLE = {
+  primary: false,
+  primaryRail: 'hooks',
+  roles: ['fallback', 'replay', 'audit']
+} as const;
+
 const CODEX_SAMPLE_SCHEMA: TranscriptSchema = {
   name: 'codex',
   version: '0.3',
-  description: 'Schema for Codex session JSONL files under ~/.codex/sessions.',
+  description: 'Fallback/replay/audit schema for Codex session JSONL files under ~/.codex/sessions.',
   events: [
     {
       name: 'session-meta',
@@ -78,7 +84,7 @@ const CODEX_SAMPLE_SCHEMA: TranscriptSchema = {
     },
     {
       name: 'session-end',
-      match: { path: 'payload.type', in: ['turn_aborted', 'turn_completed'] },
+      match: { path: 'payload.type', in: ['turn_aborted', 'turn_completed', 'task_complete'] },
       action: 'session_end'
     }
   ]

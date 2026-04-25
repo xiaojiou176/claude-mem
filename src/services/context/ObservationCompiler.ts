@@ -10,6 +10,12 @@ import { SessionStore } from '../sqlite/SessionStore.js';
 import { logger } from '../../utils/logger.js';
 import { SYSTEM_REMINDER_REGEX } from '../../utils/tag-stripping.js';
 import { CLAUDE_CONFIG_DIR } from '../../shared/paths.js';
+import {
+  COMPACT_DURABLE_RAIL,
+  COMPACT_LEGACY_RAILS,
+  type DurableCompactRailEntry,
+} from '../codex-events/CompactContinuationBuilder.js';
+import type { CanonicalEvent } from '../codex-events/CanonicalEvent.js';
 import type {
   ContextConfig,
   Observation,
@@ -19,6 +25,60 @@ import type {
   PriorMessages,
 } from './types.js';
 import { SUMMARY_LOOKAHEAD } from './types.js';
+
+export interface ChildReceiptObservationOptions {
+  startId?: number;
+  observedAtEpoch?: number;
+}
+
+function childReceiptTitle(event: CanonicalEvent<'child_session'>): string {
+  const status = event.payload.status ?? 'reported';
+  const childSessionId = event.payload.childSessionId ?? event.payload.agentId ?? 'unknown-child';
+  return `Codex child ${status}: ${childSessionId}`;
+}
+
+export function compileChildReceiptObservations(
+  events: Array<CanonicalEvent | Record<string, any>>,
+  options: ChildReceiptObservationOptions = {}
+): Observation[] {
+  const startId = options.startId ?? -1;
+  const baseEpoch = options.observedAtEpoch ?? Date.now();
+  return events
+    .filter((event): event is CanonicalEvent<'child_session'> => event.type === 'child_session')
+    .map((event, index) => {
+      const childSessionId = event.payload.childSessionId ?? event.payload.agentId ?? 'unknown-child';
+      const terminalMessage = typeof event.metadata?.terminalMessage === 'string'
+        ? event.metadata.terminalMessage
+        : '';
+      const observedAt = event.observedAt ?? new Date(baseEpoch + index).toISOString();
+      return {
+        id: startId + index,
+        memory_session_id: event.session.id,
+        platform_source: event.session.platformSource,
+        type: 'child_terminal',
+        title: childReceiptTitle(event),
+        subtitle: 'Codex host-max degraded receipt; not SubagentStop parity',
+        narrative: terminalMessage,
+        facts: JSON.stringify([
+          `parent_thread_id=${event.session.id}`,
+          `child_agent_path=${childSessionId}`,
+          `terminal_status=${event.payload.status ?? 'reported'}`
+        ]),
+        concepts: JSON.stringify([
+          'codex',
+          'child-receipt',
+          'subagent-notification',
+          'host-max-degraded'
+        ]),
+        files_read: null,
+        files_modified: null,
+        discovery_tokens: null,
+        created_at: observedAt,
+        created_at_epoch: baseEpoch + index,
+        project: event.session.project
+      };
+    });
+}
 
 /**
  * Query observations from database with type and concept filtering
@@ -328,4 +388,87 @@ export function getFullObservationIds(observations: Observation[], count: number
       .slice(0, count)
       .map(obs => obs.id)
   );
+}
+
+function parseJsonRecord(value: string | null): Record<string, unknown> {
+  if (!value) return {};
+
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function parseJsonStringArray(value: string | null): string[] {
+  if (!value) return [];
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === 'string')
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+}
+
+function hasLegacyOnlyEvidence(observation: Observation): boolean {
+  const haystack = [
+    observation.title,
+    observation.subtitle,
+    observation.narrative,
+    observation.facts,
+    observation.concepts,
+  ].filter(Boolean).join('\n');
+
+  return COMPACT_LEGACY_RAILS.some(rail => haystack.includes(rail));
+}
+
+/**
+ * Extract durable compact receipts from already-loaded observations.
+ *
+ * The durable rail is intentionally narrower than "any compact-looking text":
+ * legacy `thread/compacted` / `ContextCompacted` observations are ignored unless
+ * they also carry `ThreadItem::ContextCompaction` evidence.
+ */
+export function extractDurableCompactRail(observations: Observation[]): DurableCompactRailEntry[] {
+  const entries: DurableCompactRailEntry[] = [];
+
+  for (const observation of observations) {
+    const facts = parseJsonRecord(observation.facts);
+    const concepts = parseJsonStringArray(observation.concepts);
+    const durableRail = stringValue(facts.durableRail);
+    const hasDurableRail = durableRail === COMPACT_DURABLE_RAIL ||
+      concepts.includes('ContextCompaction') && [
+        observation.title,
+        observation.subtitle,
+        observation.narrative,
+        observation.facts,
+      ].filter(Boolean).join('\n').includes(COMPACT_DURABLE_RAIL);
+
+    if (!hasDurableRail) {
+      if (hasLegacyOnlyEvidence(observation)) {
+        continue;
+      }
+      continue;
+    }
+
+    entries.push({
+      observationId: observation.id,
+      memorySessionId: observation.memory_session_id,
+      durableRail: COMPACT_DURABLE_RAIL,
+      summary: stringValue(facts.summary) ?? observation.narrative ?? observation.title ?? 'compact durable receipt',
+      createdAt: observation.created_at,
+    });
+  }
+
+  return entries;
 }

@@ -4,6 +4,13 @@ import { logger } from '../../utils/logger.js';
 
 export interface TranscriptWatchState {
   offsets: Record<string, number>;
+  replay?: TranscriptReplayState;
+}
+
+export interface TranscriptReplayState {
+  mode: 'fallback_replay_audit';
+  lastCanonicalEventId?: string;
+  highWatermarks?: Record<string, number>;
 }
 
 export function loadWatchState(statePath: string): TranscriptWatchState {
@@ -16,7 +23,7 @@ export function loadWatchState(statePath: string): TranscriptWatchState {
     if (!parsed.offsets) return { offsets: {} };
     return parsed;
   } catch (error) {
-    logger.warn('TRANSCRIPT', 'Failed to load watch state, starting fresh', {
+    logger.warn('WORKER', 'Failed to load transcript watch state, starting fresh', {
       statePath,
       error: error instanceof Error ? error.message : String(error)
     });
@@ -32,7 +39,7 @@ export function saveWatchState(statePath: string, state: TranscriptWatchState): 
     }
     writeFileSync(statePath, JSON.stringify(state, null, 2));
   } catch (error) {
-    logger.warn('TRANSCRIPT', 'Failed to save watch state', {
+    logger.warn('WORKER', 'Failed to save transcript watch state', {
       statePath,
       error: error instanceof Error ? error.message : String(error)
     });

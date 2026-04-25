@@ -10,7 +10,12 @@ import { homedir } from 'os';
 import { unlinkSync } from 'fs';
 import { SessionStore } from '../sqlite/SessionStore.js';
 import { logger } from '../../utils/logger.js';
-import { getProjectContext } from '../../utils/project-name.js';
+import { resolveContextScope } from '../../utils/project-name.js';
+import {
+  buildCompactAfterContinuationSpine,
+  isCompactContinuationEvent,
+  shouldRenderCompactContinuationSpine,
+} from '../codex-events/CompactContinuationBuilder.js';
 
 import type { ContextInput, ContextConfig, Observation, SessionSummary } from './types.js';
 import { loadContextConfig } from './ContextConfigLoader.js';
@@ -24,6 +29,7 @@ import {
   prepareSummariesForTimeline,
   buildTimeline,
   getFullObservationIds,
+  extractDurableCompactRail,
 } from './ObservationCompiler.js';
 import { renderHeader } from './sections/HeaderRenderer.js';
 import { renderTimeline } from './sections/TimelineRenderer.js';
@@ -84,7 +90,8 @@ function buildContextOutput(
   config: ContextConfig,
   cwd: string,
   sessionId: string | undefined,
-  forHuman: boolean
+  forHuman: boolean,
+  compactContinuationSpine?: string
 ): string {
   const output: string[] = [];
 
@@ -93,6 +100,11 @@ function buildContextOutput(
 
   // Render header section
   output.push(...renderHeader(project, economics, config, forHuman));
+
+  if (compactContinuationSpine) {
+    output.push(compactContinuationSpine);
+    output.push('');
+  }
 
   // Prepare timeline data
   const displaySummaries = summaries.slice(0, config.sessionCount);
@@ -133,14 +145,14 @@ export async function generateContext(
 ): Promise<string> {
   const config = loadContextConfig();
   const cwd = input?.cwd ?? process.cwd();
-  const context = getProjectContext(cwd);
+  const scope = resolveContextScope(cwd, input?.projects);
 
-  // Single source of truth: explicit projects override cwd-derived context.
-  // `project` (used for header + single-project query) is always the last entry
-  // of `projects` so the empty-state header and the query target stay in sync
-  // when a caller passes `projects` without a matching cwd (e.g. worker route).
-  const projects = input?.projects?.length ? input.projects : context.allProjects;
-  const project = projects[projects.length - 1] ?? context.primary;
+  // Context shaping contract:
+  // - cwd-derived scope remains the storage/session truth (`scope.storageProject`)
+  // - explicit projects only override read/query precedence for projected context
+  // - the last read project is the header + single-project query target
+  const projects = scope.allProjects;
+  const project = scope.project;
 
   // Full mode: fetch all observations but keep normal rendering (level 1 summaries)
   if (input?.full) {
@@ -162,9 +174,18 @@ export async function generateContext(
     const summaries = projects.length > 1
       ? querySummariesMulti(db, projects, config)
       : querySummaries(db, project, config);
+    const compactContinuationSpine = shouldRenderCompactContinuationSpine({
+      source: input?.source,
+      canonicalEvent: input?.canonicalEvent,
+    })
+      ? buildCompactAfterContinuationSpine({
+        event: isCompactContinuationEvent(input?.canonicalEvent) ? input.canonicalEvent : undefined,
+        durableEntries: extractDurableCompactRail(observations),
+      })
+      : undefined;
 
     // Handle empty state
-    if (observations.length === 0 && summaries.length === 0) {
+    if (observations.length === 0 && summaries.length === 0 && !compactContinuationSpine) {
       return renderEmptyState(project, forHuman);
     }
 
@@ -176,7 +197,8 @@ export async function generateContext(
       config,
       cwd,
       input?.session_id,
-      forHuman
+      forHuman,
+      compactContinuationSpine
     );
 
     return output;
