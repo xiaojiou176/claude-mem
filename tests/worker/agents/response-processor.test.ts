@@ -2,8 +2,9 @@ import { describe, it, expect, mock, beforeEach, afterEach, spyOn } from 'bun:te
 import { logger } from '../../../src/utils/logger.js';
 
 // Mock modules that cause import chain issues - MUST be before imports
-// Use full paths from test file location
-mock.module('../../../src/services/worker-service.js', () => ({
+// Use the actual imported dependency instead of worker-service.js so Bun's
+// module mock does not pollute unrelated WorkerService tests in the same run.
+mock.module('../../../src/services/integrations/CursorHooksInstaller.js', () => ({
   updateCursorContextForProject: () => Promise.resolve(),
 }));
 
@@ -47,6 +48,7 @@ describe('ResponseProcessor', () => {
   let mockChromaSyncSummary: ReturnType<typeof mock>;
   let mockBroadcast: ReturnType<typeof mock>;
   let mockBroadcastProcessingStatus: ReturnType<typeof mock>;
+  let mockMarkFailed: ReturnType<typeof mock>;
   let mockDbManager: DatabaseManager;
   let mockSessionManager: SessionManager;
   let mockWorker: WorkerRef;
@@ -69,6 +71,7 @@ describe('ResponseProcessor', () => {
 
     mockChromaSyncObservation = mock(() => Promise.resolve());
     mockChromaSyncSummary = mock(() => Promise.resolve());
+    mockMarkFailed = mock(() => {});
 
     mockDbManager = {
       getSessionStore: () => ({
@@ -88,6 +91,7 @@ describe('ResponseProcessor', () => {
       },
       getPendingMessageStore: () => ({
         markProcessed: mock(() => {}),
+        markFailed: mockMarkFailed,
         confirmProcessed: mock(() => {}),  // CLAIM-CONFIRM pattern: confirm after successful storage
         cleanupProcessed: mock(() => 0),
         resetStuckMessages: mock(() => 0),
@@ -215,8 +219,8 @@ describe('ResponseProcessor', () => {
   });
 
   describe('non-XML observer responses', () => {
-    it('warns when the observer returns prose that will be discarded', async () => {
-      const session = createMockSession();
+    it('warns and marks messages failed when the observer returns non-XML prose', async () => {
+      const session = createMockSession({ processingMessageIds: [101, 102] });
       const responseText = 'Skipping — repeated log scan with no new findings.';
 
       await processAgentResponse(
@@ -232,15 +236,17 @@ describe('ResponseProcessor', () => {
 
       expect(logger.warn).toHaveBeenCalledWith(
         'PARSER',
-        'TestAgent returned non-XML response; observation content was discarded',
+        'TestAgent returned non-XML response; marking messages as failed for retry (#1874)',
         expect.objectContaining({
           sessionId: 1,
           preview: responseText
         })
       );
-      const [, , observations, summary] = mockStoreObservations.mock.calls[0];
-      expect(observations).toHaveLength(0);
-      expect(summary).toBeNull();
+      expect(mockStoreObservations).not.toHaveBeenCalled();
+      expect(mockMarkFailed).toHaveBeenCalledTimes(2);
+      expect(mockMarkFailed).toHaveBeenNthCalledWith(1, 101);
+      expect(mockMarkFailed).toHaveBeenNthCalledWith(2, 102);
+      expect(session.processingMessageIds).toEqual([]);
     });
   });
 
@@ -508,8 +514,8 @@ describe('ResponseProcessor', () => {
       expect(summary).toBeNull();
     });
 
-    it('should handle response with only text (no XML)', async () => {
-      const session = createMockSession();
+    it('should mark response with only text (no XML) as failed for retry', async () => {
+      const session = createMockSession({ processingMessageIds: [201] });
       const responseText = 'This is just plain text without any XML tags.';
 
       mockStoreObservations = mock(() => ({
@@ -534,9 +540,9 @@ describe('ResponseProcessor', () => {
         'TestAgent'
       );
 
-      expect(mockStoreObservations).toHaveBeenCalledTimes(1);
-      const [, , observations] = mockStoreObservations.mock.calls[0];
-      expect(observations).toHaveLength(0);
+      expect(mockStoreObservations).not.toHaveBeenCalled();
+      expect(mockMarkFailed).toHaveBeenCalledWith(201);
+      expect(session.processingMessageIds).toEqual([]);
     });
   });
 
@@ -683,6 +689,43 @@ describe('ResponseProcessor', () => {
           'TestAgent'
         )
       ).rejects.toThrow('Cannot store observations: memorySessionId not yet captured');
+    });
+
+    it('should fail and clear processing message ids when observation storage throws', async () => {
+      const session = createMockSession({
+        processingMessageIds: [301, 302],
+      });
+      const storageError = new Error('sqlite busy during store');
+      mockStoreObservations.mockImplementation(() => {
+        throw storageError;
+      });
+
+      await expect(processAgentResponse(
+        `
+        <observation>
+          <type>bugfix</type>
+          <title>Storage failure regression</title>
+          <facts></facts>
+          <concepts></concepts>
+          <files_read></files_read>
+          <files_modified></files_modified>
+        </observation>
+        `,
+        session,
+        mockDbManager,
+        mockSessionManager,
+        mockWorker,
+        100,
+        null,
+        'TestAgent'
+      )).rejects.toThrow('sqlite busy during store');
+
+      expect(mockMarkFailed).toHaveBeenCalledTimes(2);
+      expect(mockMarkFailed).toHaveBeenNthCalledWith(1, 301);
+      expect(mockMarkFailed).toHaveBeenNthCalledWith(2, 302);
+      expect(session.processingMessageIds).toEqual([]);
+      expect(session.pendingAgentId).toBeNull();
+      expect(session.pendingAgentType).toBeNull();
     });
   });
 

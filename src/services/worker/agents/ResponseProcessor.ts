@@ -99,12 +99,18 @@ export async function processAgentResponse(
       preview
     });
 
-    // Mark messages as failed (retry logic in PendingMessageStore handles retries)
-    const pendingStore = sessionManager.getPendingMessageStore();
-    for (const messageId of session.processingMessageIds) {
-      pendingStore.markFailed(messageId);
+    if (summaryExpected) {
+      session.lastSummaryStored = false;
+      session.consecutiveSummaryFailures += 1;
+      if (session.consecutiveSummaryFailures >= MAX_CONSECUTIVE_SUMMARY_FAILURES) {
+        logger.error('SESSION', `Circuit breaker: ${session.consecutiveSummaryFailures} consecutive summary failures — further summarize requests will be skipped (#1633)`, {
+          sessionId: session.sessionDbId,
+          contentSessionId: session.contentSessionId
+        });
+      }
     }
-    session.processingMessageIds = [];
+
+    markProcessingMessagesFailedForRetry(session, sessionManager);
     return;
   }
 
@@ -159,6 +165,9 @@ export async function processAgentResponse(
       originalTimestamp ?? undefined,
       modelId
     );
+  } catch (error) {
+    markProcessingMessagesFailedForRetry(session, sessionManager);
+    throw error;
   } finally {
     session.pendingAgentId = null;
     session.pendingAgentType = null;
@@ -247,6 +256,19 @@ export async function processAgentResponse(
 
   // Clean up session state
   cleanupProcessedMessages(session, worker);
+}
+
+function markProcessingMessagesFailedForRetry(
+  session: ActiveSession,
+  sessionManager: SessionManager
+): void {
+  if (session.processingMessageIds.length === 0) return;
+
+  const pendingStore = sessionManager.getPendingMessageStore();
+  for (const messageId of session.processingMessageIds) {
+    pendingStore.markFailed(messageId);
+  }
+  session.processingMessageIds = [];
 }
 
 /**
@@ -341,9 +363,8 @@ async function syncAndBroadcastObservations(
   // This runs per-observation batch to ensure folders are updated as work happens
   // Only runs if CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED is true (default: false)
   const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-  // Handle both string 'true' and boolean true from JSON settings
   const settingValue = settings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED;
-  const folderClaudeMdEnabled = settingValue === 'true' || settingValue === true;
+  const folderClaudeMdEnabled = settingValue === 'true';
 
   if (folderClaudeMdEnabled) {
     const allFilePaths: string[] = [];

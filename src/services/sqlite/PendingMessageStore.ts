@@ -27,6 +27,8 @@ export interface PersistentPendingMessage {
   // Claude Code subagent identity — NULL for main-session messages.
   agent_type: string | null;
   agent_id: string | null;
+  // Stable PostToolUse identity, when the host provides one.
+  tool_use_id: string | null;
 }
 
 /**
@@ -54,6 +56,29 @@ export class PendingMessageStore {
   constructor(db: Database, maxRetries: number = 3) {
     this.db = db;
     this.maxRetries = maxRetries;
+    this.ensureToolUseIdColumn();
+  }
+
+  private serializeJsonColumn(value: unknown): string | null {
+    return value ? JSON.stringify(value) : null;
+  }
+
+  private getToolUseId(message: PendingMessage): string | null {
+    const toolUseId = (message as PendingMessage & { toolUseId?: unknown }).toolUseId;
+    return typeof toolUseId === 'string' && toolUseId.trim() ? toolUseId.trim() : null;
+  }
+
+  private ensureToolUseIdColumn(): void {
+    const table = this.db.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pending_messages'
+    `).get() as { name: string } | null;
+    if (!table) return;
+
+    const columns = this.db.prepare('PRAGMA table_info(pending_messages)').all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === 'tool_use_id')) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN tool_use_id TEXT');
+    }
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_tool_use_id ON pending_messages(session_db_id, tool_use_id)');
   }
 
   /**
@@ -68,8 +93,8 @@ export class PendingMessageStore {
         tool_name, tool_input, tool_response, cwd,
         last_assistant_message,
         prompt_number, status, retry_count, created_at_epoch,
-        agent_type, agent_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+        agent_type, agent_id, tool_use_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
     `);
 
     const result = stmt.run(
@@ -77,17 +102,87 @@ export class PendingMessageStore {
       contentSessionId,
       message.type,
       message.tool_name || null,
-      message.tool_input ? JSON.stringify(message.tool_input) : null,
-      message.tool_response ? JSON.stringify(message.tool_response) : null,
+      this.serializeJsonColumn(message.tool_input),
+      this.serializeJsonColumn(message.tool_response),
       message.cwd || null,
       message.last_assistant_message || null,
       message.prompt_number || null,
       now,
       message.agentType ?? null,
-      message.agentId ?? null
+      message.agentId ?? null,
+      this.getToolUseId(message)
     );
 
     return result.lastInsertRowid as number;
+  }
+
+  /**
+   * Detect exact duplicate active observation work already persisted for a session.
+   *
+   * This gives PostToolUse dedupe a restart-safe backstop: after a worker restart,
+   * the in-memory toolUseId set is empty, but pending/processing rows still carry
+   * the observation payload. Only active rows are considered; confirmed rows are
+   * deleted and failed rows are intentionally left available for retry/new work.
+   */
+  hasActiveDuplicateObservation(sessionDbId: number, message: PendingMessage): boolean {
+    if (message.type !== 'observation') return false;
+
+    const toolUseId = this.getToolUseId(message);
+    if (toolUseId) {
+      const byToolUseIdStmt = this.db.prepare(`
+        SELECT 1 FROM pending_messages
+        WHERE session_db_id = ?
+          AND message_type = 'observation'
+          AND status IN ('pending', 'processing')
+          AND tool_use_id = ?
+        LIMIT 1
+      `);
+      return byToolUseIdStmt.get(sessionDbId, toolUseId) !== null;
+    }
+
+    const stmt = this.db.prepare(`
+      SELECT 1 FROM pending_messages
+      WHERE session_db_id = ?
+        AND message_type = 'observation'
+        AND status IN ('pending', 'processing')
+        AND tool_use_id IS NULL
+        AND COALESCE(tool_name, '') = COALESCE(?, '')
+        AND COALESCE(tool_input, '') = COALESCE(?, '')
+        AND COALESCE(tool_response, '') = COALESCE(?, '')
+        AND COALESCE(cwd, '') = COALESCE(?, '')
+        AND COALESCE(prompt_number, -1) = COALESCE(?, -1)
+        AND COALESCE(agent_type, '') = COALESCE(?, '')
+        AND COALESCE(agent_id, '') = COALESCE(?, '')
+      LIMIT 1
+    `);
+    const existing = stmt.get(
+      sessionDbId,
+      message.tool_name ?? null,
+      this.serializeJsonColumn(message.tool_input),
+      this.serializeJsonColumn(message.tool_response),
+      message.cwd ?? null,
+      message.prompt_number ?? null,
+      message.agentType ?? null,
+      message.agentId ?? null
+    ) as { 1: number } | null;
+    return existing !== null;
+  }
+
+  /**
+   * Count active queued/processing observations for a single tool family.
+   * Used for lightweight backpressure so one noisy PostToolUse family cannot
+   * consume the entire per-session observation queue.
+   */
+  getPendingObservationToolCount(sessionDbId: number, toolName: string): number {
+    const stmt = this.db.prepare(`
+      SELECT COUNT(*) as count FROM pending_messages
+      WHERE session_db_id = ?
+        AND message_type = 'observation'
+        AND status IN ('pending', 'processing')
+        AND COALESCE(tool_name, '') = COALESCE(?, '')
+    `);
+    const result = stmt.get(sessionDbId, toolName) as { count: number };
+    return result.count;
   }
 
   /**
@@ -108,7 +203,7 @@ export class PendingMessageStore {
         UPDATE pending_messages
         SET status = 'pending', started_processing_at_epoch = NULL
         WHERE session_db_id = ? AND status = 'processing'
-          AND started_processing_at_epoch < ?
+          AND (started_processing_at_epoch IS NULL OR started_processing_at_epoch < ?)
       `);
       const resetResult = resetStmt.run(sessionId, staleCutoff);
       if (resetResult.changes > 0) {
@@ -171,14 +266,17 @@ export class PendingMessageStore {
       stmt = this.db.prepare(`
         UPDATE pending_messages
         SET status = 'pending', started_processing_at_epoch = NULL
-        WHERE status = 'processing' AND started_processing_at_epoch < ? AND session_db_id = ?
+        WHERE status = 'processing'
+          AND (started_processing_at_epoch IS NULL OR started_processing_at_epoch < ?)
+          AND session_db_id = ?
       `);
       result = stmt.run(cutoff, sessionDbId);
     } else {
       stmt = this.db.prepare(`
         UPDATE pending_messages
         SET status = 'pending', started_processing_at_epoch = NULL
-        WHERE status = 'processing' AND started_processing_at_epoch < ?
+        WHERE status = 'processing'
+          AND (started_processing_at_epoch IS NULL OR started_processing_at_epoch < ?)
       `);
       result = stmt.run(cutoff);
     }
@@ -229,7 +327,8 @@ export class PendingMessageStore {
     const cutoff = Date.now() - thresholdMs;
     const stmt = this.db.prepare(`
       SELECT COUNT(*) as count FROM pending_messages
-      WHERE status = 'processing' AND started_processing_at_epoch < ?
+      WHERE status = 'processing'
+        AND (started_processing_at_epoch IS NULL OR started_processing_at_epoch < ?)
     `);
     const result = stmt.get(cutoff) as { count: number };
     return result.count;
@@ -318,7 +417,8 @@ export class PendingMessageStore {
     const stmt = this.db.prepare(`
       UPDATE pending_messages
       SET status = 'pending', started_processing_at_epoch = NULL
-      WHERE status = 'processing' AND started_processing_at_epoch < ?
+      WHERE status = 'processing'
+        AND (started_processing_at_epoch IS NULL OR started_processing_at_epoch < ?)
     `);
     const result = stmt.run(cutoff);
     return result.changes;
@@ -384,7 +484,8 @@ export class PendingMessageStore {
     const stmt = this.db.prepare(`
       UPDATE pending_messages
       SET status = 'pending', started_processing_at_epoch = NULL
-      WHERE status = 'processing' AND started_processing_at_epoch < ?
+      WHERE status = 'processing'
+        AND (started_processing_at_epoch IS NULL OR started_processing_at_epoch < ?)
     `);
 
     const result = stmt.run(cutoff);
@@ -426,7 +527,8 @@ export class PendingMessageStore {
     const resetStmt = this.db.prepare(`
       UPDATE pending_messages
       SET status = 'pending', started_processing_at_epoch = NULL
-      WHERE status = 'processing' AND started_processing_at_epoch < ?
+      WHERE status = 'processing'
+        AND (started_processing_at_epoch IS NULL OR started_processing_at_epoch < ?)
     `);
     const resetResult = resetStmt.run(stuckCutoff);
     if (resetResult.changes > 0) {
@@ -445,12 +547,67 @@ export class PendingMessageStore {
    * Get all session IDs that have pending messages (for recovery on startup)
    */
   getSessionsWithPendingMessages(): number[] {
+    this.recoverProcessingRowsForQueueScan();
+
     const stmt = this.db.prepare(`
-      SELECT DISTINCT session_db_id FROM pending_messages
-      WHERE status IN ('pending', 'processing')
+      SELECT DISTINCT pm.session_db_id
+      FROM pending_messages pm
+      JOIN sdk_sessions s ON s.id = pm.session_db_id
+      WHERE pm.status IN ('pending', 'processing')
+        AND s.status = 'active'
     `);
     const results = stmt.all() as { session_db_id: number }[];
     return results.map(r => r.session_db_id);
+  }
+
+  /**
+   * Deterministically recover queue rows that no live owner can complete before
+   * startup/periodic queue recovery decides which sessions to restart.
+   *
+   * - Non-active or missing owner session: fail processing rows; the session is
+   *   no longer a valid recovery owner.
+   * - Active owner with timed-out or timestampless processing row: reset to
+   *   pending so the next generator can reclaim it.
+   */
+  private recoverProcessingRowsForQueueScan(thresholdMs: number = 5 * 60 * 1000): void {
+    const now = Date.now();
+    const staleCutoff = now - thresholdMs;
+
+    const failInvalidOwnerStmt = this.db.prepare(`
+      UPDATE pending_messages
+      SET status = 'failed',
+          failed_at_epoch = ?,
+          started_processing_at_epoch = NULL
+      WHERE status = 'processing'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sdk_sessions s
+          WHERE s.id = pending_messages.session_db_id
+            AND s.status = 'active'
+        )
+    `);
+    const failed = failInvalidOwnerStmt.run(now);
+    if (failed.changes > 0) {
+      logger.info('QUEUE', `FAILED_ORPHAN_PROCESSING | count=${failed.changes} | reason=invalid_owner_session`);
+    }
+
+    const resetStaleActiveOwnerStmt = this.db.prepare(`
+      UPDATE pending_messages
+      SET status = 'pending',
+          started_processing_at_epoch = NULL
+      WHERE status = 'processing'
+        AND (started_processing_at_epoch IS NULL OR started_processing_at_epoch < ?)
+        AND EXISTS (
+          SELECT 1
+          FROM sdk_sessions s
+          WHERE s.id = pending_messages.session_db_id
+            AND s.status = 'active'
+        )
+    `);
+    const reset = resetStaleActiveOwnerStmt.run(staleCutoff);
+    if (reset.changes > 0) {
+      logger.info('QUEUE', `RESET_ORPHAN_PROCESSING | count=${reset.changes} | thresholdMs=${thresholdMs}`);
+    }
   }
 
   /**

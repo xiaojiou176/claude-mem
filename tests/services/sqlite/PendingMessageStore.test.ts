@@ -22,7 +22,7 @@ describe('PendingMessageStore - Self-Healing claimNextMessage', () => {
   });
 
   function enqueueMessage(overrides: Partial<PendingMessage> = {}): number {
-    const message: PendingMessage = {
+    const message: PendingMessage & { toolUseId: string } = {
       type: 'observation',
       tool_name: 'TestTool',
       tool_input: { test: 'input' },
@@ -142,5 +142,110 @@ describe('PendingMessageStore - Self-Healing claimNextMessage', () => {
     // Session 1's stuck message should still be stuck (not healed by session 2's claim)
     const session1Msg = db.query('SELECT status FROM pending_messages WHERE id = ?').get(stuckInSession1) as { status: string };
     expect(session1Msg.status).toBe('processing');
+  });
+
+  test('resetStaleProcessingMessages recovers processing rows with missing start timestamp', () => {
+    const msgId = enqueueMessage();
+    db.run(
+      `UPDATE pending_messages SET status = 'processing', started_processing_at_epoch = NULL WHERE id = ?`,
+      [msgId]
+    );
+
+    const resetCount = store.resetStaleProcessingMessages(60_000);
+
+    expect(resetCount).toBe(1);
+    const row = db.query('SELECT status, started_processing_at_epoch FROM pending_messages WHERE id = ?').get(msgId) as {
+      status: string;
+      started_processing_at_epoch: number | null;
+    };
+    expect(row.status).toBe('pending');
+    expect(row.started_processing_at_epoch).toBeNull();
+  });
+
+  test('getSessionsWithPendingMessages resets stale processing rows before reporting recoverable sessions', () => {
+    const msgId = enqueueMessage();
+    db.run(
+      `UPDATE pending_messages SET status = 'processing', started_processing_at_epoch = ? WHERE id = ?`,
+      [Date.now() - 10 * 60_000, msgId]
+    );
+
+    const sessions = store.getSessionsWithPendingMessages();
+
+    expect(sessions).toContain(sessionDbId);
+    const row = db.query('SELECT status, started_processing_at_epoch FROM pending_messages WHERE id = ?').get(msgId) as {
+      status: string;
+      started_processing_at_epoch: number | null;
+    };
+    expect(row.status).toBe('pending');
+    expect(row.started_processing_at_epoch).toBeNull();
+  });
+
+  test('getSessionsWithPendingMessages fails processing rows owned by non-active sessions', () => {
+    const msgId = enqueueMessage();
+    db.run(
+      `UPDATE pending_messages SET status = 'processing', started_processing_at_epoch = ? WHERE id = ?`,
+      [Date.now() - 10 * 60_000, msgId]
+    );
+    db.run(
+      `UPDATE sdk_sessions SET status = 'completed', completed_at_epoch = ? WHERE id = ?`,
+      [Date.now(), sessionDbId]
+    );
+
+    const sessions = store.getSessionsWithPendingMessages();
+
+    expect(sessions).not.toContain(sessionDbId);
+    const row = db.query('SELECT status, failed_at_epoch FROM pending_messages WHERE id = ?').get(msgId) as {
+      status: string;
+      failed_at_epoch: number | null;
+    };
+    expect(row.status).toBe('failed');
+    expect(row.failed_at_epoch).toBeGreaterThan(0);
+  });
+
+  test('detects duplicate active observation payloads persisted before a worker restart', () => {
+    const message: PendingMessage = {
+      type: 'observation',
+      tool_name: 'Bash',
+      tool_input: { command: 'printf ok' },
+      tool_response: { output: 'ok' },
+      prompt_number: 3,
+      cwd: '/repo',
+      agentId: 'agent-1',
+      agentType: 'implementation-worker',
+      toolUseId: 'call_bash_restart_safe',
+    };
+    store.enqueue(sessionDbId, CONTENT_SESSION_ID, message);
+
+    expect(store.hasActiveDuplicateObservation(sessionDbId, message)).toBe(true);
+    expect(store.hasActiveDuplicateObservation(sessionDbId, {
+      ...message,
+      toolUseId: 'call_bash_restart_safe_new',
+    })).toBe(false);
+
+    const toolUseIdlessMessage: PendingMessage = {
+      type: 'observation',
+      tool_name: 'Bash',
+      tool_input: { command: 'printf ok' },
+      tool_response: { output: 'different' },
+      prompt_number: 3,
+      cwd: '/repo',
+      agentId: 'agent-1',
+      agentType: 'implementation-worker',
+    };
+    expect(store.hasActiveDuplicateObservation(sessionDbId, toolUseIdlessMessage)).toBe(false);
+
+    store.enqueue(sessionDbId, CONTENT_SESSION_ID, toolUseIdlessMessage);
+    expect(store.hasActiveDuplicateObservation(sessionDbId, toolUseIdlessMessage)).toBe(true);
+  });
+
+  test('counts active observation backlog for a single tool family only', () => {
+    enqueueMessage({ tool_name: 'Bash' });
+    enqueueMessage({ tool_name: 'Bash' });
+    const processedId = enqueueMessage({ tool_name: 'Bash' });
+    enqueueMessage({ tool_name: 'Read' });
+    db.run('UPDATE pending_messages SET status = ? WHERE id = ?', ['failed', processedId]);
+
+    expect(store.getPendingObservationToolCount(sessionDbId, 'Bash')).toBe(2);
+    expect(store.getPendingObservationToolCount(sessionDbId, 'Read')).toBe(1);
   });
 });
