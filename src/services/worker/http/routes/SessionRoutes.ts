@@ -26,6 +26,32 @@ import { getProjectContext } from '../../../../utils/project-name.js';
 import { normalizePlatformSource } from '../../../../shared/platform-source.js';
 import { RestartGuard } from '../../RestartGuard.js';
 
+export const OBSERVATION_PAYLOAD_CHAR_CAP = 16_000;
+
+const OBSERVATION_SECRET_PATTERNS: Array<[RegExp, string]> = [
+  [/sk-[A-Za-z0-9_-]{8,}/g, '[REDACTED]'],
+  [/ghp_[A-Za-z0-9_]{8,}/g, '[REDACTED]'],
+  [/github_pat_[A-Za-z0-9_]{8,}/g, '[REDACTED]'],
+  [/AKIA[0-9A-Z]{12,}/g, '[REDACTED]'],
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/gi, 'Bearer [REDACTED]'],
+  [/"(api[_-]?key|token|secret|password)"\s*:\s*"[^"]{4,}"/gi, '"$1":"[REDACTED]"'],
+];
+
+function capObservationPayload(value: string): string {
+  if (value.length <= OBSERVATION_PAYLOAD_CHAR_CAP) return value;
+
+  const suffix = `...[truncated ${value.length - OBSERVATION_PAYLOAD_CHAR_CAP} chars]`;
+  return value.slice(0, Math.max(0, OBSERVATION_PAYLOAD_CHAR_CAP - suffix.length)) + suffix;
+}
+
+export function sanitizeObservationPayload(value: string): string {
+  let sanitized = value;
+  for (const [pattern, replacement] of OBSERVATION_SECRET_PATTERNS) {
+    sanitized = sanitized.replace(pattern, replacement);
+  }
+  return capObservationPayload(sanitized);
+}
+
 export class SessionRoutes extends BaseRouteHandler {
   private completionHandler: SessionCompletionHandler;
   private spawnInProgress = new Map<number, boolean>();
@@ -124,6 +150,20 @@ export class SessionRoutes extends BaseRouteHandler {
       pendingStore.markAllSessionMessagesAbandoned(sessionDbId);
       this.sessionManager.removeSessionImmediate(sessionDbId);
       return;
+    }
+
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const pendingCount = pendingStore.getPendingCount(sessionDbId);
+
+    if (session.generatorPromise && session.abortController.signal.aborted && pendingCount > 0) {
+      logger.warn('SESSION', 'Aborted generator still has pending work; restarting to drain queue', {
+        sessionId: sessionDbId,
+        queueDepth: pendingCount,
+        source
+      });
+      session.generatorPromise = null;
+      session.abortController = new AbortController();
+      session.lastGeneratorActivity = Date.now();
     }
 
     // GUARD: Prevent duplicate spawns
@@ -601,6 +641,9 @@ export class SessionRoutes extends BaseRouteHandler {
    */
   private handleObservationsByClaudeId = this.wrapHandler((req: Request, res: Response): void => {
     const { contentSessionId, tool_name, tool_input, tool_response, cwd, agentId, agentType } = req.body;
+    const toolUseId = typeof req.body.toolUseId === 'string'
+      ? req.body.toolUseId
+      : (typeof req.body.tool_use_id === 'string' ? req.body.tool_use_id : undefined);
     const platformSource = normalizePlatformSource(req.body.platformSource);
     const project = typeof cwd === 'string' && cwd.trim() ? getProjectContext(cwd).primary : '';
 
@@ -663,15 +706,15 @@ export class SessionRoutes extends BaseRouteHandler {
 
     // Strip memory tags from tool_input and tool_response
     const cleanedToolInput = tool_input !== undefined
-      ? stripMemoryTagsFromJson(JSON.stringify(tool_input))
+      ? sanitizeObservationPayload(stripMemoryTagsFromJson(JSON.stringify(tool_input)))
       : '{}';
 
     const cleanedToolResponse = tool_response !== undefined
-      ? stripMemoryTagsFromJson(JSON.stringify(tool_response))
+      ? sanitizeObservationPayload(stripMemoryTagsFromJson(JSON.stringify(tool_response)))
       : '{}';
 
     // Queue observation
-    this.sessionManager.queueObservation(sessionDbId, {
+    const queueResult = this.sessionManager.queueObservation(sessionDbId, {
       tool_name,
       tool_input: cleanedToolInput,
       tool_response: cleanedToolResponse,
@@ -685,7 +728,17 @@ export class SessionRoutes extends BaseRouteHandler {
       })(),
       agentId: typeof agentId === 'string' ? agentId : undefined,
       agentType: typeof agentType === 'string' ? agentType : undefined,
+      toolUseId,
     });
+
+    if (!queueResult.queued) {
+      res.json({
+        status: 'skipped',
+        reason: queueResult.reason,
+        queueDepth: queueResult.queueDepth
+      });
+      return;
+    }
 
     // Ensure SDK agent is running
     this.ensureGeneratorRunning(sessionDbId, 'observation');
@@ -826,7 +879,17 @@ export class SessionRoutes extends BaseRouteHandler {
     // Complete the session (removes from active sessions map if present)
     // Note: The Stop hook (summarize handler) waits for pending work before calling
     // this endpoint. No polling here — that's the hook's responsibility.
-    await this.completionHandler.completeByDbId(sessionDbId);
+    const completionResult = await this.completionHandler.completeByDbId(sessionDbId);
+
+    if (!completionResult.completed && completionResult.reason === 'pending_work') {
+      this.ensureGeneratorRunning(sessionDbId, 'session-complete-pending-work');
+      res.json({
+        status: 'pending_work',
+        sessionDbId,
+        queueLength: completionResult.queueDepth ?? 0
+      });
+      return;
+    }
 
     logger.info('SESSION', 'Session completed via API', {
       contentSessionId,

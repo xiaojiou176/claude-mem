@@ -14,6 +14,12 @@ import { SessionEventBroadcaster } from '../events/SessionEventBroadcaster.js';
 import { DatabaseManager } from '../DatabaseManager.js';
 import { logger } from '../../../utils/logger.js';
 
+export interface SessionCompletionResult {
+  completed: boolean;
+  reason?: 'pending_work';
+  queueDepth?: number;
+}
+
 export class SessionCompletionHandler {
   constructor(
     private sessionManager: SessionManager,
@@ -84,13 +90,32 @@ export class SessionCompletionHandler {
    * HTTP route wraps this so older callers that still POST to
    * /api/sessions/complete keep working even after the worker self-cleans.
    */
-  async completeByDbId(sessionDbId: number): Promise<void> {
+  async completeByDbId(sessionDbId: number): Promise<SessionCompletionResult> {
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const queueDepth = pendingStore.getPendingCount(sessionDbId);
+    if (queueDepth > 0) {
+      logger.warn('SESSION', 'Deferring session completion until pending work drains', {
+        sessionId: sessionDbId,
+        queueDepth
+      });
+      return { completed: false, reason: 'pending_work', queueDepth };
+    }
+
     // Finalize first so the DB and broadcast state are consistent even if
     // deleteSession hangs on a slow subprocess exit.
     this.finalizeSession(sessionDbId);
 
-    // Abort SDK agent and clean in-memory state. Idempotent: deleteSession
-    // early-returns if the session isn't in the active map.
-    await this.sessionManager.deleteSession(sessionDbId);
+    // Abort SDK agent and clean in-memory state, but do not block the HTTP
+    // response path on slow generator/subprocess shutdown. The stop/session-
+    // complete hook only needs durable completion + best-effort cleanup kickoff
+    // to return a truthful receipt.
+    void this.sessionManager.deleteSession(sessionDbId).catch((error: unknown) => {
+      logger.warn('SESSION', 'Background deleteSession cleanup failed after finalizeSession', {
+        sessionId: sessionDbId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+
+    return { completed: true, queueDepth: 0 };
   }
 }

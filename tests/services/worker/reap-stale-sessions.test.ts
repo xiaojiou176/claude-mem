@@ -17,12 +17,20 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach, mock, setSystemTime } from 'bun:test';
+import { EventEmitter } from 'events';
 import {
   MAX_GENERATOR_IDLE_MS,
   MAX_SESSION_IDLE_MS,
   detectStaleGenerator,
+  evictIdleGenerator,
+  SessionManager,
   type StaleGeneratorCandidate,
 } from '../../../src/services/worker/SessionManager.js';
+import {
+  getActiveProcesses,
+  registerProcess,
+  unregisterProcess,
+} from '../../../src/services/worker/ProcessRegistry.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -64,11 +72,53 @@ function createSession(overrides: Partial<TestSession> = {}): TestSession {
   };
 }
 
+function clearProcessRegistry() {
+  for (const proc of getActiveProcesses()) {
+    unregisterProcess(proc.pid);
+  }
+}
+
+function createTrackedMockProcess() {
+  const emitter = new EventEmitter();
+  const proc = Object.assign(emitter, {
+    pid: Math.floor(Math.random() * 100000) + 1000,
+    exitCode: null as number | null,
+    killed: false,
+    _lastSignal: undefined as string | number | undefined,
+    kill(signal?: string | number) {
+      proc.killed = true;
+      proc._lastSignal = signal;
+      return true;
+    },
+    stdin: null,
+    stdout: null,
+    stderr: null,
+  });
+  return proc;
+}
+
+function createSessionManagerWithPendingCounts(pendingCounts: Map<number, number>): SessionManager {
+  const manager = new SessionManager({} as any);
+  (manager as any).pendingStore = {
+    getPendingCount(sessionDbId: number) {
+      return pendingCounts.get(sessionDbId) ?? 0;
+    },
+  };
+  return manager;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 describe('reapStaleSessions — stale generator detection (Issue #1652)', () => {
+  beforeEach(() => {
+    clearProcessRegistry();
+  });
+
+  afterEach(() => {
+    clearProcessRegistry();
+  });
 
   describe('threshold constants', () => {
     test('MAX_GENERATOR_IDLE_MS should be 5 minutes', () => {
@@ -184,6 +234,78 @@ describe('reapStaleSessions — stale generator detection (Issue #1652)', () => 
 
       // AbortController should still be aborted to signal the generator loop
       expect(session.abortController.signal.aborted).toBe(true);
+    });
+  });
+
+  describe('idle generator eviction for pool starvation', () => {
+    test('should SIGKILL an already-aborted idle generator instead of repeating a no-op abort', () => {
+      const session = createSession({
+        generatorPromise: Promise.resolve(),
+        lastGeneratorActivity: Date.now() - 30_000,
+      });
+      const proc = createMockProcess();
+      session.abortController.abort();
+
+      const evicted = evictIdleGenerator(session, proc);
+
+      expect(evicted).toBe(true);
+      expect(proc.killed).toBe(true);
+      expect(proc._lastSignal).toBe('SIGKILL');
+    });
+
+    test('should preserve valid pending-work semantics by only aborting fresh idle generators gracefully', () => {
+      const session = createSession({
+        generatorPromise: Promise.resolve(),
+        lastGeneratorActivity: Date.now() - 30_000,
+      });
+      const proc = createMockProcess();
+
+      const evicted = evictIdleGenerator(session, proc);
+
+      expect(evicted).toBe(true);
+      expect(session.abortController.signal.aborted).toBe(true);
+      expect(proc.killed).toBe(false);
+    });
+
+    test('should evict an already-aborted generator even when pending work remains', () => {
+      const pendingCounts = new Map([[101, 1]]);
+      const manager = createSessionManagerWithPendingCounts(pendingCounts);
+      const session = createSession({
+        sessionDbId: 101,
+        generatorPromise: Promise.resolve(),
+        lastGeneratorActivity: Date.now() - 30_000,
+      });
+      session.abortController.abort();
+      (manager as any).sessions.set(101, session);
+
+      const proc = createTrackedMockProcess();
+      registerProcess(proc.pid, 101, proc as any);
+
+      const evicted = manager.evictIdlestSession();
+
+      expect(evicted).toBe(true);
+      expect(proc.killed).toBe(true);
+      expect(proc._lastSignal).toBe('SIGKILL');
+    });
+
+    test('should not evict active pending-work generators that are not already aborted', () => {
+      const pendingCounts = new Map([[202, 1]]);
+      const manager = createSessionManagerWithPendingCounts(pendingCounts);
+      const session = createSession({
+        sessionDbId: 202,
+        generatorPromise: Promise.resolve(),
+        lastGeneratorActivity: Date.now() - 30_000,
+      });
+      (manager as any).sessions.set(202, session);
+
+      const proc = createTrackedMockProcess();
+      registerProcess(proc.pid, 202, proc as any);
+
+      const evicted = manager.evictIdlestSession();
+
+      expect(evicted).toBe(false);
+      expect(proc.killed).toBe(false);
+      expect(session.abortController.signal.aborted).toBe(false);
     });
   });
 

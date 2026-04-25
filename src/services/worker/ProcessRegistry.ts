@@ -55,6 +55,10 @@ function getTrackedProcesses(): TrackedProcess[] {
  * Register a spawned process in the registry
  */
 export function registerProcess(pid: number, sessionDbId: number, process: ChildProcess): void {
+  if (reservedSlots > 0) {
+    reservedSlots--;
+  }
+
   getSupervisor().registerProcess(`sdk:${sessionDbId}:${pid}`, {
     pid,
     type: 'sdk',
@@ -100,15 +104,39 @@ export function getActiveCount(): number {
   return getSupervisor().getRegistry().getAll().filter(record => record.type === 'sdk').length;
 }
 
-// Waiters for pool slots - resolved when a process exits and frees a slot
-const slotWaiters: Array<() => void> = [];
+interface SlotWaiter {
+  maxConcurrent: number;
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}
+
+// Waiters for pool slots - resolved FIFO when a process exits and frees a slot
+const slotWaiters: SlotWaiter[] = [];
+// Slots granted to waiters but not yet reflected in the process registry.
+// waitForSlot() resolves before createPidCapturingSpawn() can register the child PID,
+// so this prevents a same-tick new caller from stealing that just-granted slot.
+let reservedSlots = 0;
+
+function getEffectiveActiveCount(): number {
+  return getActiveCount() + reservedSlots;
+}
 
 /**
  * Notify waiters that a slot has freed up
  */
 function notifySlotAvailable(): void {
-  const waiter = slotWaiters.shift();
-  if (waiter) waiter();
+  while (slotWaiters.length > 0) {
+    const waiter = slotWaiters[0];
+    if (getEffectiveActiveCount() >= waiter.maxConcurrent) {
+      return;
+    }
+
+    slotWaiters.shift();
+    clearTimeout(waiter.timeout);
+    reservedSlots++;
+    waiter.resolve();
+  }
 }
 
 /**
@@ -126,43 +154,46 @@ export async function waitForSlot(
 ): Promise<void> {
   // Hard cap: refuse to spawn if too many processes exist regardless of pool accounting
   const activeCount = getActiveCount();
-  if (activeCount >= TOTAL_PROCESS_HARD_CAP) {
-    throw new Error(`Hard cap exceeded: ${activeCount} processes in registry (cap=${TOTAL_PROCESS_HARD_CAP}). Refusing to spawn more.`);
+  const effectiveActiveCount = activeCount + reservedSlots;
+  if (effectiveActiveCount >= TOTAL_PROCESS_HARD_CAP) {
+    throw new Error(`Hard cap exceeded: ${activeCount} processes in registry + ${reservedSlots} reserved slots (cap=${TOTAL_PROCESS_HARD_CAP}). Refusing to spawn more.`);
   }
 
-  if (activeCount < maxConcurrent) return;
+  if (slotWaiters.length === 0 && effectiveActiveCount < maxConcurrent) {
+    reservedSlots++;
+    return;
+  }
 
   // Try to evict an idle session before waiting (#1868)
   // Idle sessions hold pool slots during their 3-min idle timeout, blocking new sessions
   // that would timeout after 60s. Eviction aborts the idle session asynchronously —
   // the freed slot is picked up by the waiter mechanism below.
-  if (evictIdleSession) {
+  if (activeCount >= maxConcurrent && evictIdleSession) {
     const evicted = evictIdleSession();
     if (evicted) {
       logger.info('PROCESS', 'Evicted idle session to free pool slot for waiting request');
     }
   }
 
-  logger.info('PROCESS', `Pool limit reached (${activeCount}/${maxConcurrent}), waiting for slot...`);
+  logger.info('PROCESS', `Pool limit reached (${activeCount}/${maxConcurrent}, reserved=${reservedSlots}), waiting for slot...`);
 
   return new Promise<void>((resolve, reject) => {
+    let waiter: SlotWaiter;
     const timeout = setTimeout(() => {
-      const idx = slotWaiters.indexOf(onSlot);
+      const idx = slotWaiters.indexOf(waiter);
       if (idx >= 0) slotWaiters.splice(idx, 1);
       reject(new Error(`Timed out waiting for agent pool slot after ${timeoutMs}ms`));
     }, timeoutMs);
 
-    const onSlot = () => {
-      clearTimeout(timeout);
-      if (getActiveCount() < maxConcurrent) {
-        resolve();
-      } else {
-        // Still full, re-queue
-        slotWaiters.push(onSlot);
-      }
+    waiter = {
+      maxConcurrent,
+      resolve,
+      reject,
+      timeout
     };
 
-    slotWaiters.push(onSlot);
+    slotWaiters.push(waiter);
+    notifySlotAvailable();
   });
 }
 
@@ -228,6 +259,37 @@ export async function ensureProcessExit(tracked: TrackedProcess, timeoutMs: numb
   unregisterProcess(pid);
 }
 
+const MIN_IDLE_DAEMON_CHILD_MINUTES = 2;
+
+export interface IdleDaemonChildCandidate {
+  pid: number;
+  ppid: number;
+  cpu: number;
+  idleMinutes: number;
+}
+
+export function shouldKillIdleDaemonChild(
+  candidate: IdleDaemonChildCandidate,
+  daemonPid: number,
+  activeSessionIds: Set<number>
+): boolean {
+  if (candidate.ppid !== daemonPid) return false;
+  if (candidate.cpu > 0) return false;
+  if (candidate.idleMinutes < MIN_IDLE_DAEMON_CHILD_MINUTES) return false;
+
+  const registry = getSupervisor().getRegistry();
+  const records = registry.getByPid(candidate.pid);
+  for (const record of records) {
+    if (record.type !== 'sdk') continue;
+    const sessionDbId = Number(record.sessionId);
+    if (activeSessionIds.has(sessionDbId)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 /**
  * Kill idle daemon children (claude processes spawned by worker-service)
  *
@@ -239,9 +301,10 @@ export async function ensureProcessExit(tracked: TrackedProcess, timeoutMs: numb
  * - Process name is "claude"
  * - Parent PID is the worker-service daemon (this process)
  * - Process has 0% CPU (idle)
- * - Process has been running for more than 2 minutes
+ * - Process has been running idle for at least 2 minutes
+ * - Process is not still registered to an active session
  */
-async function killIdleDaemonChildren(): Promise<number> {
+async function killIdleDaemonChildren(activeSessionIds: Set<number>): Promise<number> {
   if (process.platform === 'win32') {
     // Windows: Different process model, skip for now
     return 0;
@@ -290,15 +353,16 @@ async function killIdleDaemonChildren(): Promise<number> {
         minutes = parseInt(minMatch[1], 10);
       }
 
-      // Kill if idle for more than 1 minute
-      if (minutes >= 1) {
-        logger.info('PROCESS', `Killing idle daemon child PID ${pid} (idle ${minutes}m)`, { pid, minutes });
-        try {
-          process.kill(pid, 'SIGKILL');
-          killed++;
-        } catch {
-          // Already dead or permission denied
-        }
+      if (!shouldKillIdleDaemonChild({ pid, ppid, cpu, idleMinutes: minutes }, daemonPid, activeSessionIds)) {
+        continue;
+      }
+
+      logger.info('PROCESS', `Killing idle daemon child PID ${pid} (idle ${minutes}m)`, { pid, minutes });
+      try {
+        process.kill(pid, 'SIGKILL');
+        killed++;
+      } catch {
+        // Already dead or permission denied
       }
     }
   } catch {
@@ -376,7 +440,7 @@ export async function reapOrphanedProcesses(activeSessionIds: Set<number>): Prom
   killed += await killSystemOrphans();
 
   // Daemon children: find idle SDK processes that didn't terminate
-  killed += await killIdleDaemonChildren();
+  killed += await killIdleDaemonChildren(activeSessionIds);
 
   return killed;
 }

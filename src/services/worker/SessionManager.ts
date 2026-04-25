@@ -25,13 +25,30 @@ export const MAX_GENERATOR_IDLE_MS = 5 * 60 * 1000; // 5 minutes
 /** Idle threshold before a no-generator session with no pending work is reaped. */
 export const MAX_SESSION_IDLE_MS = 15 * 60 * 1000; // 15 minutes
 
+/** Per-session observation queue cap for high-frequency PostToolUse bursts. */
+export const MAX_OBSERVATION_QUEUE_DEPTH = 500;
+
+/** Per-tool-family cap leaves room for other PostToolUse families under bursts. */
+export const MAX_OBSERVATION_TOOL_FAMILY_QUEUE_DEPTH = Math.floor(MAX_OBSERVATION_QUEUE_DEPTH * 0.8);
+
+export interface QueueObservationResult {
+  queued: boolean;
+  reason?: 'duplicate_tool_use' | 'queue_backpressure' | 'tool_backpressure';
+  queueDepth: number;
+}
+
+type ObservationQueueData = ObservationData & {
+  /** Stable platform tool-use identity used for in-memory dedupe/accounting. */
+  toolUseId?: string;
+};
+
 /**
  * Minimal process interface used by detectStaleGenerator — compatible with
  * both the real Bun.Subprocess / ChildProcess shapes and test mocks.
  */
 export interface StaleGeneratorProcess {
   exitCode: number | null;
-  kill(signal?: string): boolean | void;
+  kill(signal?: string | number): boolean | void;
 }
 
 /**
@@ -42,6 +59,10 @@ export interface StaleGeneratorCandidate {
   generatorPromise: Promise<void> | null;
   lastGeneratorActivity: number;
   abortController: AbortController;
+}
+
+export interface IdleGeneratorCandidate extends StaleGeneratorCandidate {
+  idleTimedOut?: boolean;
 }
 
 /**
@@ -83,10 +104,46 @@ export function detectStaleGenerator(
   return true;
 }
 
+/**
+ * Evict a generator that is holding a pool slot while it has no pending work.
+ *
+ * Fresh idle generators get a graceful abort first. If the generator is already
+ * aborted or has exceeded the stale-generator threshold, escalate to SIGKILL so
+ * waitForSlot() does not repeatedly "evict" the same session without freeing a
+ * real process slot.
+ */
+export function evictIdleGenerator(
+  session: IdleGeneratorCandidate,
+  proc: StaleGeneratorProcess | undefined,
+  now = Date.now()
+): boolean {
+  if (!session.generatorPromise) return false;
+
+  session.idleTimedOut = true;
+  const generatorIdleMs = now - session.lastGeneratorActivity;
+  const shouldForceKill = session.abortController.signal.aborted || generatorIdleMs > MAX_GENERATOR_IDLE_MS;
+
+  if (shouldForceKill && proc && proc.exitCode === null) {
+    try {
+      proc.kill('SIGKILL');
+    } catch (error) {
+      if (error instanceof Error) {
+        logger.warn('SESSION', 'Failed to SIGKILL idle generator subprocess during eviction', {}, error);
+      } else {
+        logger.warn('SESSION', 'Failed to SIGKILL idle generator subprocess during eviction with non-Error', {}, new Error(String(error)));
+      }
+    }
+  }
+
+  session.abortController.abort();
+  return true;
+}
+
 export class SessionManager {
   private dbManager: DatabaseManager;
   private sessions: Map<number, ActiveSession> = new Map();
   private sessionQueues: Map<number, EventEmitter> = new Map();
+  private seenToolUseIds: Map<number, Set<string>> = new Map();
   private onSessionDeletedCallback?: () => void;
   private pendingStore: PendingMessageStore | null = null;
 
@@ -273,15 +330,17 @@ export class SessionManager {
    * CRITICAL: Persists to database FIRST before adding to in-memory queue.
    * This ensures observations survive worker crashes.
    */
-  queueObservation(sessionDbId: number, data: ObservationData): void {
+  queueObservation(sessionDbId: number, data: ObservationQueueData): QueueObservationResult {
     // Auto-initialize from database if needed (handles worker restarts)
     let session = this.sessions.get(sessionDbId);
     if (!session) {
       session = this.initializeSession(sessionDbId);
     }
 
-    // CRITICAL: Persist to database FIRST
-    const message: PendingMessage = {
+    const pendingStore = this.getPendingStore();
+    const toolUseId = typeof data.toolUseId === 'string' ? data.toolUseId.trim() : '';
+    const queueDepthBefore = pendingStore.getPendingCount(sessionDbId);
+    const message: PendingMessage & { toolUseId?: string } = {
       type: 'observation',
       tool_name: data.tool_name,
       tool_input: data.tool_input,
@@ -289,16 +348,70 @@ export class SessionManager {
       prompt_number: data.prompt_number,
       cwd: data.cwd,
       agentId: data.agentId,
-      agentType: data.agentType
+      agentType: data.agentType,
+      toolUseId: toolUseId || undefined
     };
 
+    if (toolUseId) {
+      const seen = this.seenToolUseIds.get(sessionDbId);
+      if (seen?.has(toolUseId)) {
+        logger.debug('QUEUE', 'Skipping duplicate observation tool_use_id', {
+          sessionId: sessionDbId,
+          tool: data.tool_name,
+          toolUseId,
+          queueDepth: queueDepthBefore
+        });
+        return { queued: false, reason: 'duplicate_tool_use', queueDepth: queueDepthBefore };
+      }
+    }
+
+    if (pendingStore.hasActiveDuplicateObservation(sessionDbId, message)) {
+      logger.debug('QUEUE', 'Skipping duplicate active observation already persisted', {
+        sessionId: sessionDbId,
+        tool: data.tool_name,
+        queueDepth: queueDepthBefore
+      });
+      return { queued: false, reason: 'duplicate_tool_use', queueDepth: queueDepthBefore };
+    }
+
+    if (queueDepthBefore >= MAX_OBSERVATION_QUEUE_DEPTH) {
+      logger.warn('QUEUE', 'Observation queue depth cap reached; dropping PostToolUse observation', {
+        sessionId: sessionDbId,
+        tool: data.tool_name,
+        queueDepth: queueDepthBefore,
+        maxQueueDepth: MAX_OBSERVATION_QUEUE_DEPTH
+      });
+      return { queued: false, reason: 'queue_backpressure', queueDepth: queueDepthBefore };
+    }
+
+    const toolFamilyDepth = pendingStore.getPendingObservationToolCount(sessionDbId, data.tool_name);
+    if (toolFamilyDepth >= MAX_OBSERVATION_TOOL_FAMILY_QUEUE_DEPTH) {
+      logger.warn('QUEUE', 'Observation tool-family queue cap reached; reserving capacity for other tools', {
+        sessionId: sessionDbId,
+        tool: data.tool_name,
+        queueDepth: queueDepthBefore,
+        toolFamilyDepth,
+        maxToolFamilyDepth: MAX_OBSERVATION_TOOL_FAMILY_QUEUE_DEPTH
+      });
+      return { queued: false, reason: 'tool_backpressure', queueDepth: queueDepthBefore };
+    }
+
     try {
-      const messageId = this.getPendingStore().enqueue(sessionDbId, session.contentSessionId, message);
-      const queueDepth = this.getPendingStore().getPendingCount(sessionDbId);
+      const messageId = pendingStore.enqueue(sessionDbId, session.contentSessionId, message);
+      const queueDepth = pendingStore.getPendingCount(sessionDbId);
+      if (toolUseId) {
+        const seen = this.seenToolUseIds.get(sessionDbId) ?? new Set<string>();
+        seen.add(toolUseId);
+        this.seenToolUseIds.set(sessionDbId, seen);
+      }
       const toolSummary = logger.formatTool(data.tool_name, data.tool_input);
       logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=observation | tool=${toolSummary} | depth=${queueDepth}`, {
         sessionId: sessionDbId
       });
+      // Notify generator immediately (zero latency)
+      const emitter = this.sessionQueues.get(sessionDbId);
+      emitter?.emit('message');
+      return { queued: true, queueDepth };
     } catch (error) {
       if (error instanceof Error) {
         logger.error('SESSION', 'Failed to persist observation to DB', {
@@ -313,10 +426,6 @@ export class SessionManager {
       }
       throw error; // Don't continue if we can't persist
     }
-
-    // Notify generator immediately (zero latency)
-    const emitter = this.sessionQueues.get(sessionDbId);
-    emitter?.emit('message');
   }
 
   /**
@@ -432,6 +541,7 @@ export class SessionManager {
     // 4. Cleanup
     this.sessions.delete(sessionDbId);
     this.sessionQueues.delete(sessionDbId);
+    this.seenToolUseIds.delete(sessionDbId);
 
     logger.info('SESSION', 'Session deleted', {
       sessionId: sessionDbId,
@@ -456,6 +566,7 @@ export class SessionManager {
 
     this.sessions.delete(sessionDbId);
     this.sessionQueues.delete(sessionDbId);
+    this.seenToolUseIds.delete(sessionDbId);
 
     logger.info('SESSION', 'Session removed from active sessions', {
       sessionId: sessionDbId,
@@ -481,7 +592,8 @@ export class SessionManager {
     for (const [sessionDbId, session] of this.sessions) {
       if (!session.generatorPromise) continue; // No generator = no slot held
       const pendingCount = this.getPendingStore().getPendingCount(sessionDbId);
-      if (pendingCount > 0) continue; // Has work to do, don't evict
+      const isAlreadyAborted = session.abortController.signal.aborted;
+      if (pendingCount > 0 && !isAlreadyAborted) continue; // Has active work to do, don't evict
 
       // Pick the session with the oldest lastGeneratorActivity (idlest)
       if (session.lastGeneratorActivity < oldestActivity) {
@@ -497,12 +609,12 @@ export class SessionManager {
 
     logger.info('SESSION', 'Evicting idle session to free pool slot for new request (#1868)', {
       sessionDbId: idlestSessionId,
-      idleDurationMs: Date.now() - oldestActivity
+      idleDurationMs: Date.now() - oldestActivity,
+      alreadyAborted: session.abortController.signal.aborted
     });
 
-    session.idleTimedOut = true;
-    session.abortController.abort();
-    return true;
+    const trackedProcess = getProcessBySession(idlestSessionId);
+    return evictIdleGenerator(session, trackedProcess?.process, Date.now());
   }
 
   /**
