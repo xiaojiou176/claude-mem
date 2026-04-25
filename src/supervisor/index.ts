@@ -141,6 +141,9 @@ class Supervisor {
 }
 
 const supervisorSingleton = new Supervisor(getProcessRegistry());
+let supervisorOverride:
+  | Pick<Supervisor, 'assertCanSpawn' | 'registerProcess' | 'unregisterProcess' | 'getRegistry'>
+  | null = null;
 
 export async function startSupervisor(): Promise<void> {
   await supervisorSingleton.start();
@@ -151,7 +154,23 @@ export async function stopSupervisor(): Promise<void> {
 }
 
 export function getSupervisor(): Supervisor {
-  return supervisorSingleton;
+  return (supervisorOverride ?? supervisorSingleton) as Supervisor;
+}
+
+/**
+ * Test-only escape hatch for replacing the live supervisor singleton.
+ *
+ * Worker-level tests may import ProcessRegistry after other suites already
+ * loaded it, making module mocks too late to prevent leakage from the real
+ * host supervisor registry. This keeps production behavior unchanged while
+ * allowing deterministic test isolation.
+ */
+export function setSupervisorForTests(
+  supervisor:
+    | Pick<Supervisor, 'assertCanSpawn' | 'registerProcess' | 'unregisterProcess' | 'getRegistry'>
+    | null
+): void {
+  supervisorOverride = supervisor;
 }
 
 export function configureSupervisorSignalHandlers(shutdownHandler: () => Promise<void>): void {

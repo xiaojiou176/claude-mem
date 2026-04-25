@@ -1,5 +1,31 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll, mock } from 'bun:test';
+import type { ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import path from 'path';
+import { createProcessRegistry, type ManagedProcessInfo } from '../../src/supervisor/process-registry.js';
+
+const testSupervisorDir = mkdtempSync(path.join(tmpdir(), 'claude-mem-process-registry-test-'));
+const testSupervisorRegistry = createProcessRegistry(path.join(testSupervisorDir, 'supervisor.json'));
+
+mock.module('../../src/supervisor/index.js', () => ({
+  getSupervisor: () => ({
+    assertCanSpawn: () => {},
+    registerProcess: (id: string, processInfo: ManagedProcessInfo, processRef?: ChildProcess) => {
+      testSupervisorRegistry.register(id, processInfo, processRef);
+    },
+    unregisterProcess: (id: string) => {
+      testSupervisorRegistry.unregister(id);
+    },
+    getRegistry: () => testSupervisorRegistry,
+  }),
+}));
+
+afterAll(() => {
+  rmSync(testSupervisorDir, { recursive: true, force: true });
+});
+
 import {
   registerProcess,
   unregisterProcess,
@@ -8,6 +34,7 @@ import {
   getActiveProcesses,
   waitForSlot,
   ensureProcessExit,
+  shouldKillIdleDaemonChild,
 } from '../../src/services/worker/ProcessRegistry.js';
 
 /**
@@ -41,6 +68,7 @@ function clearRegistry() {
   for (const p of getActiveProcesses()) {
     unregisterProcess(p.pid);
   }
+  testSupervisorRegistry.clear();
 }
 
 describe('ProcessRegistry', () => {
@@ -86,6 +114,9 @@ describe('ProcessRegistry', () => {
   describe('waitForSlot', () => {
     it('should resolve immediately when under limit', async () => {
       await waitForSlot(2); // 0 processes, limit 2
+      const proc = createMockProcess();
+      registerProcess(proc.pid, 1, proc as any);
+      unregisterProcess(proc.pid);
     });
 
     it('should wait until a slot opens', async () => {
@@ -101,7 +132,10 @@ describe('ProcessRegistry', () => {
       setTimeout(() => unregisterProcess(proc1.pid), 50);
 
       await waitPromise; // Should resolve once slot freed
-      expect(getActiveCount()).toBe(1);
+      const replacement = createMockProcess();
+      registerProcess(replacement.pid, 3, replacement as any);
+      expect(getActiveCount()).toBe(2);
+      unregisterProcess(replacement.pid);
     });
 
     it('should throw on timeout when no slot opens', async () => {
@@ -123,6 +157,29 @@ describe('ProcessRegistry', () => {
       }
 
       await expect(waitForSlot(20)).rejects.toThrow('Hard cap exceeded');
+    });
+
+    it('should not let new callers bypass an already-awakened waiter', async () => {
+      const proc1 = createMockProcess();
+      registerProcess(proc1.pid, 1, proc1 as any);
+
+      let replacement: ReturnType<typeof createMockProcess> | undefined;
+      const firstWaiter = waitForSlot(1, 500).then(() => {
+        replacement = createMockProcess();
+        registerProcess(replacement.pid, 101, replacement as any);
+      });
+
+      unregisterProcess(proc1.pid);
+
+      const barger = waitForSlot(1, 75);
+
+      await firstWaiter;
+
+      await expect(barger).rejects.toThrow('Timed out waiting for agent pool slot');
+
+      if (replacement) {
+        unregisterProcess(replacement.pid);
+      }
     });
   });
 
@@ -199,6 +256,38 @@ describe('ProcessRegistry', () => {
       expect(elapsed).toBeGreaterThan(90);
       // Process is unregistered regardless (safety net)
       expect(getActiveCount()).toBe(0);
+    });
+  });
+
+  describe('idle daemon child cleanup policy', () => {
+    it('should not kill a daemon child that is still registered to an active session', () => {
+      const proc = createMockProcess();
+      registerProcess(proc.pid, 450, proc as any);
+
+      expect(shouldKillIdleDaemonChild({
+        pid: proc.pid,
+        ppid: process.pid,
+        cpu: 0,
+        idleMinutes: 10
+      }, process.pid, new Set([450]))).toBe(false);
+    });
+
+    it('should not kill short-idle unregistered daemon children', () => {
+      expect(shouldKillIdleDaemonChild({
+        pid: 999_001,
+        ppid: process.pid,
+        cpu: 0,
+        idleMinutes: 1
+      }, process.pid, new Set())).toBe(false);
+    });
+
+    it('should allow killing an old idle unregistered daemon child', () => {
+      expect(shouldKillIdleDaemonChild({
+        pid: 999_002,
+        ppid: process.pid,
+        cpu: 0,
+        idleMinutes: 10
+      }, process.pid, new Set())).toBe(true);
     });
   });
 });
