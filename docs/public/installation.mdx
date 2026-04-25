@@ -37,10 +37,41 @@ Both methods will automatically configure hooks and start the worker service. St
 > **SDK/library only**. It does **not** register plugin hooks or start the worker service.
 > Always install via `npx claude-mem install` or the `/plugin` commands above.
 
+### Option 3: Codex CLI (Experimental/Internal RC)
+
+Codex CLI has a conservative install path through the npx installer:
+
+```bash
+npx claude-mem install --ide codex-cli
+```
+
+This path is **not** the Claude Code plugin marketplace flow. The plugin payload
+still lands in the regular marketplace install tree, but Codex-specific wiring is
+configured separately:
+
+| Surface | Path | What happens |
+|---|---|---|
+| Plugin payload | `~/.claude/plugins/marketplaces/thedotmack/` | The bundled plugin, worker, scripts, and dependencies are copied here. |
+| Codex hooks | `~/.codex/hooks.json` | Claude-Mem hook entries are merged without deleting other non-claude-mem hooks. |
+| Transcript fallback | `~/.claude-mem/transcript-watch.json` | Adds a Codex watch for `~/.codex/sessions/**/*.jsonl` as fallback/replay/audit. |
+| Workspace projection | `<workspace>/AGENTS.md` | Context is projected into the active workspace instead of a global Codex context block. |
+
+Use this only with the current release wording:
+
+- ✅ `experimental/internal RC`
+- ✅ `hook-first basic with transcript-backed fallback`
+- ✅ `Codex host-max path`
+- ❌ `public stable release ready`
+- ❌ `Claude Code full parity`
+- ❌ `PreCompact` / `SubagentStop` / `SessionEnd` parity
+
+See [Codex CLI Integration](codex-cli) for the full status and verification notes.
+
 ## System Requirements
 
 - **Node.js**: 18.0.0 or higher
 - **Claude Code**: Latest version with plugin support
+- **Codex CLI**: Optional, experimental/internal RC install path only
 - **Bun**: JavaScript runtime and process manager (auto-installed if missing)
 - **SQLite 3**: For persistent storage (bundled)
 

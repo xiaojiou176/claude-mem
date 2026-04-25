@@ -35,6 +35,7 @@
         "pages": [
           "introduction",
           "installation",
+          "codex-cli",
           "usage/getting-started",
           "usage/openrouter-provider",
           "usage/gemini-provider",

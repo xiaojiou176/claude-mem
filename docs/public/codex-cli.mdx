@@ -1,0 +1,110 @@
+---
+title: "Codex CLI Integration"
+description: "Experimental/internal RC Codex CLI install path for Claude-Mem"
+---
+
+# Codex CLI Integration
+
+> **Status:** Experimental / internal RC. This page documents the Codex CLI
+> install path that exists today. It is not a public-stable release claim, and
+> it is not Claude Code full parity.
+
+Claude-Mem can be wired into Codex CLI through the npx installer. The goal is a
+conservative **Codex host-max path**: use the host surfaces Codex currently gives
+us, keep transcript replay as a fallback/audit rail, and avoid claiming parity
+with Claude Code lifecycle hooks that Codex does not expose.
+
+## Install
+
+Use the direct IDE installer:
+
+```bash
+npx claude-mem install --ide codex-cli
+```
+
+The interactive installer can also offer Codex CLI when it detects `~/.codex`.
+
+## How this differs from Claude Code marketplace install
+
+Claude Code has native plugin marketplace commands:
+
+```bash
+/plugin marketplace add thedotmack/claude-mem
+/plugin install claude-mem
+```
+
+Codex CLI does **not** use those slash commands directly. For Codex, the npx
+installer performs two jobs:
+
+1. It copies and registers the Claude-Mem plugin payload in the normal
+   marketplace install tree.
+2. It writes Codex-specific hook and transcript configuration.
+
+## Files touched by the Codex installer
+
+| Surface | Path | Purpose |
+|---|---|---|
+| Plugin payload | `~/.claude/plugins/marketplaces/thedotmack/` | Bundled plugin, worker, scripts, UI, skills, and dependencies. |
+| Codex hooks | `~/.codex/hooks.json` | Hook-first basic path for Codex lifecycle events. Existing non-claude-mem hooks are preserved. |
+| Transcript fallback | `~/.claude-mem/transcript-watch.json` | Watches `~/.codex/sessions/**/*.jsonl` for fallback, replay, and audit. |
+| Workspace projection | `<workspace>/AGENTS.md` | Workspace-local context projection sink used by Codex. |
+| Memory data | `~/.claude-mem/` | SQLite database, settings, logs, worker state, and transcript watcher state. |
+
+## What the Codex path can honestly claim
+
+Use this wording:
+
+- **Experimental/internal RC**
+- **Codex host-max path**
+- **Hook-first basic with transcript-backed fallback**
+- **Workspace-local `AGENTS.md` projection**
+- **Transcript fallback/replay/audit for `~/.codex/sessions/**/*.jsonl`**
+
+This means Claude-Mem can route current Codex session signals into the same
+worker/database/search pipeline used by the rest of the project, while keeping
+Codex-specific behavior visibly bounded.
+
+## What this page does not claim
+
+Do **not** describe the Codex path as:
+
+- Claude Code full parity
+- public stable release ready
+- `PreCompact` parity
+- `SubagentStop` parity
+- `SessionEnd` parity
+- Claude-style `PreToolUse(Read)` file-context rail parity
+- full MCP output mutation parity
+- proof that every host-side blocker is gone
+
+Those are host capability or release-governance claims, not installation
+instructions.
+
+## Current capability map
+
+| Lane | Current wording | Not claimed |
+|---|---|---|
+| Session start and prompt submission | Hook-first basic | Full Claude Code lifecycle parity |
+| Tool observations | Experimental Codex observation path | Public-stable `PostToolUse` release claim |
+| Session closeout | `Stop` plus transcript-backed completion route | `SessionEnd` parity |
+| File/context projection | Workspace-local `AGENTS.md` projection | Claude-style read-before-file context rail |
+| Compact and child signals | Degraded but usable transcript/receipt rails | `PreCompact` or `SubagentStop` parity |
+
+## Verification notes
+
+After installation, inspect the configured surfaces rather than relying on the
+presence of the npm package alone:
+
+```bash
+cat ~/.codex/hooks.json
+cat ~/.claude-mem/transcript-watch.json
+npx claude-mem status
+```
+
+Then restart Codex CLI so it loads the updated hook configuration.
+
+The presence of `claude-mem` on npm is not enough by itself: `npm install -g
+claude-mem` installs the SDK/library and CLI entrypoint, but it does not
+automatically register Codex hooks or transcript watching. Use
+`npx claude-mem install --ide codex-cli` for the Codex install path.
+

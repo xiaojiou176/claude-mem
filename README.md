@@ -154,6 +154,23 @@ Or install from the plugin marketplace inside Claude Code:
 
 Restart Claude Code or Gemini CLI. Context from previous sessions will automatically appear in new sessions.
 
+### Codex CLI path
+
+Claude-Mem also has an **experimental / internal RC** Codex CLI install path:
+
+```bash
+npx claude-mem install --ide codex-cli
+```
+
+This keeps the distributable plugin payload in the same marketplace install tree
+used by the other IDEs, but writes Codex-specific wiring to:
+
+- `~/.codex/hooks.json`
+- `~/.claude-mem/transcript-watch.json`
+
+It also uses workspace-local `AGENTS.md` files for projection. **This is not a public-stable parity claim.**
+Treat it as a conservative install path for testing and internal rollout only. Restart Codex CLI after installation so it reloads the updated hook configuration.
+
 > **Note:** Claude-Mem is also published on npm, but `npm install -g claude-mem` installs the **SDK/library only** — it does not register the plugin hooks or set up the worker service. Always install via `npx claude-mem install` or the `/plugin` commands above.
 
 ### 🦞 OpenClaw Gateway
@@ -188,6 +205,7 @@ The installer handles dependencies, plugin setup, AI provider configuration, wor
 ### Getting Started
 
 - **[Installation Guide](https://docs.claude-mem.ai/installation)** - Quick start & advanced installation
+- **[Codex CLI Integration](https://docs.claude-mem.ai/codex-cli)** - Experimental/internal RC install path for Codex
 - **[Gemini CLI Setup](https://docs.claude-mem.ai/gemini-cli/setup)** - Dedicated guide for Google's Gemini CLI integration
 - **[Usage Guide](https://docs.claude-mem.ai/usage/getting-started)** - How Claude-Mem works automatically
 - **[Search Tools](https://docs.claude-mem.ai/usage/search-tools)** - Query your project history with natural language
