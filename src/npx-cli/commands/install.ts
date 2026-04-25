@@ -9,7 +9,7 @@
  */
 import * as p from '@clack/prompts';
 import pc from 'picocolors';
-import { execSync } from 'child_process';
+import { execSync, type ExecSyncOptions } from 'child_process';
 import { cpSync, existsSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 
@@ -348,11 +348,13 @@ function runNpmInstallInMarketplace(): void {
 
   if (!existsSync(packageJsonPath)) return;
 
-  execSync('npm install --production', {
+  const options: ExecSyncOptions = {
     cwd: marketplaceDir,
     stdio: 'pipe',
-    ...(IS_WINDOWS ? { shell: true as const } : {}),
-  });
+  };
+  if (IS_WINDOWS) options.shell = process.env.ComSpec ?? 'cmd.exe';
+
+  execSync('npm install --production', options);
 }
 
 // ---------------------------------------------------------------------------
@@ -368,10 +370,12 @@ function runSmartInstall(): boolean {
   }
 
   try {
-    execSync(`node "${smartInstallPath}"`, {
+    const options: ExecSyncOptions = {
       stdio: 'inherit',
-      ...(IS_WINDOWS ? { shell: true as const } : {}),
-    });
+    };
+    if (IS_WINDOWS) options.shell = process.env.ComSpec ?? 'cmd.exe';
+
+    execSync(`node "${smartInstallPath}"`, options);
     return true;
   } catch (error: unknown) {
     console.warn('[install] smart-install error:', error instanceof Error ? error.message : String(error));

@@ -4,6 +4,9 @@ export interface NormalizedHookInput {
   platform?: string;   // 'claude-code', 'cursor', 'gemini-cli', etc.
   prompt?: string;
   toolName?: string;
+  // Stable tool-use identity from platforms that provide one (for example,
+  // Codex PostToolUse.tool_use_id). Used for repo-side dedupe/accounting.
+  toolUseId?: string;
   toolInput?: unknown;
   toolResponse?: unknown;
   transcriptPath?: string;

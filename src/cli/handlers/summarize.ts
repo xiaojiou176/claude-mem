@@ -95,11 +95,11 @@ export const summarizeHandler: EventHandler = {
     }
 
     if (!response.ok) {
-      return { continue: true, suppressOutput: true };
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
     logger.debug('HOOK', 'Summary request queued');
 
-    return { continue: true, suppressOutput: true };
+    return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
   }
 };

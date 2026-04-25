@@ -7,8 +7,10 @@
  * - Unknown event types handled gracefully (fixes #984)
  * - stderr suppressed in hook context (fixes #1181)
  * - Claude Code adapter defaults suppressOutput to true
+ * - Codex adapter omits unsupported suppressOutput while preserving context fields
  */
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
+import { fileURLToPath } from 'node:url';
 
 // --- Event Handler Tests ---
 
@@ -58,17 +60,87 @@ describe('Hook Lifecycle - Event Handlers', () => {
 
 describe('Codex CLI Compatibility (#744)', () => {
   describe('getPlatformAdapter', () => {
-    it('should return rawAdapter for unknown platforms like codex', async () => {
-      const { getPlatformAdapter, rawAdapter } = await import('../src/cli/adapters/index.js');
-      // Should not throw for unknown platforms — falls back to rawAdapter
+    it('should return the explicit Codex adapter for codex hooks', async () => {
+      const { getPlatformAdapter, codexCliAdapter } = await import('../src/cli/adapters/index.js');
       const adapter = getPlatformAdapter('codex');
-      expect(adapter).toBe(rawAdapter);
+      expect(adapter).toBe(codexCliAdapter);
     });
 
     it('should return rawAdapter for any unrecognized platform string', async () => {
       const { getPlatformAdapter, rawAdapter } = await import('../src/cli/adapters/index.js');
       const adapter = getPlatformAdapter('some-future-cli');
       expect(adapter).toBe(rawAdapter);
+    });
+  });
+
+  describe('codexCliAdapter payload normalization', () => {
+    it('should normalize Codex UserPromptSubmit payloads without using the raw fallback', async () => {
+      const { codexCliAdapter } = await import('../src/cli/adapters/codex-cli.js');
+      const input = codexCliAdapter.normalizeInput({
+        session_id: '019dbfbc-9ea1-70c3-a999-b5f590704279',
+        turn_id: '019dbfbc-9ed5-7590-8595-9a2d03ecf05d',
+        transcript_path: '/Users/terry/.codex/sessions/run.jsonl',
+        cwd: '/tmp/codex-spikes/hook-matrix',
+        hook_event_name: 'UserPromptSubmit',
+        model: 'gpt-5.4',
+        permission_mode: 'bypassPermissions',
+        prompt: 'Use the shell exactly once',
+      });
+
+      expect(input.sessionId).toBe('019dbfbc-9ea1-70c3-a999-b5f590704279');
+      expect(input.cwd).toBe('/tmp/codex-spikes/hook-matrix');
+      expect(input.prompt).toBe('Use the shell exactly once');
+      expect(input.transcriptPath).toBe('/Users/terry/.codex/sessions/run.jsonl');
+      expect(input.metadata).toEqual({
+        hook_event_name: 'UserPromptSubmit',
+        turn_id: '019dbfbc-9ed5-7590-8595-9a2d03ecf05d',
+        model: 'gpt-5.4',
+        permission_mode: 'bypassPermissions',
+      });
+    });
+
+    it('should normalize Codex PostToolUse payloads with tool identity metadata', async () => {
+      const { codexCliAdapter } = await import('../src/cli/adapters/codex-cli.js');
+      const input = codexCliAdapter.normalizeInput({
+        session_id: 'session-1',
+        turn_id: 'turn-1',
+        cwd: '/repo',
+        hook_event_name: 'PostToolUse',
+        tool_name: 'apply_patch',
+        tool_input: { command: '*** Begin Patch' },
+        tool_response: '{"output":"Success"}',
+        tool_use_id: 'call_patch_1',
+      });
+
+      expect(input.sessionId).toBe('session-1');
+      expect(input.toolName).toBe('apply_patch');
+      expect(input.toolInput).toEqual({ command: '*** Begin Patch' });
+      expect(input.toolResponse).toBe('{"output":"Success"}');
+      expect(input.metadata).toEqual({
+        hook_event_name: 'PostToolUse',
+        turn_id: 'turn-1',
+        tool_use_id: 'call_patch_1',
+      });
+    });
+
+    it('should format Codex hook output without Claude-only hookEventName nesting or unsupported suppressOutput', async () => {
+      const { codexCliAdapter } = await import('../src/cli/adapters/codex-cli.js');
+      const output = codexCliAdapter.formatOutput({
+        continue: true,
+        suppressOutput: true,
+        systemMessage: 'memory ready',
+        hookSpecificOutput: {
+          hookEventName: 'SessionStart',
+          additionalContext: 'remember this context',
+        },
+      });
+
+      expect(output).toEqual({
+        continue: true,
+        systemMessage: 'memory ready',
+        additionalContext: 'remember this context',
+      });
+      expect('suppressOutput' in (output as Record<string, unknown>)).toBe(false);
     });
   });
 
@@ -387,7 +459,7 @@ describe('hookCommand - stderr suppression', () => {
 
     // Verify the import includes logger
     const hookCommandSource = await Bun.file(
-      new URL('../src/cli/hook-command.ts', import.meta.url).pathname
+      fileURLToPath(new URL('../src/cli/hook-command.ts', import.meta.url))
     ).text();
 
     // Should import logger

@@ -9,6 +9,20 @@ export interface HookCommandOptions {
   skipExit?: boolean;
 }
 
+const CODEX_EVENT_ALIASES: Record<string, string> = {
+  SessionStart: 'context',
+  UserPromptSubmit: 'session-init',
+  PostToolUse: 'observation',
+  Stop: 'summarize',
+};
+
+export function resolveHookEvent(platform: string, event: string): string {
+  if (platform === 'codex' || platform === 'codex-cli') {
+    return CODEX_EVENT_ALIASES[event] ?? event;
+  }
+  return event;
+}
+
 /**
  * Classify whether an error indicates the worker is unavailable (graceful degradation)
  * vs a handler/client bug (blocking error that developers need to see).
@@ -93,7 +107,7 @@ export async function hookCommand(platform: string, event: string, options: Hook
   process.stderr.write = (() => true) as typeof process.stderr.write;
 
   const adapter = getPlatformAdapter(platform);
-  const handler = getEventHandler(event);
+  const handler = getEventHandler(resolveHookEvent(platform, event));
 
   try {
     return await executeHookPipeline(adapter, handler, platform, options);

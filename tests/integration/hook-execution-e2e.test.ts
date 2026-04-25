@@ -11,6 +11,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 import { logger } from '../../src/utils/logger.js';
 
 // Mock middleware to avoid complex dependencies
@@ -250,5 +253,181 @@ describe('Hook Execution E2E', () => {
       expect(shouldSkip).toBe(false);
       expect(cleanedPrompt.trim()).toBe('Help me write a function');
     });
+  });
+});
+
+describe('Codex hook-first basic wiring', () => {
+  it('builds Codex hooks that route the four Phase 1 events into current handlers', async () => {
+    const { buildCodexHookConfig } = await import('../../src/services/integrations/CodexCliInstaller.js');
+
+    const config = buildCodexHookConfig('/bin/bun', '/tmp/worker-service.cjs');
+
+    expect(Object.keys(config.hooks).sort()).toEqual([
+      'PostToolUse',
+      'SessionStart',
+      'Stop',
+      'UserPromptSubmit',
+    ].sort());
+
+    expect(config.hooks.SessionStart[0].hooks[0].command).toBe('"/bin/bun" "/tmp/worker-service.cjs" hook codex-cli context');
+    expect(config.hooks.UserPromptSubmit[0].hooks[0].command).toBe('"/bin/bun" "/tmp/worker-service.cjs" hook codex-cli session-init');
+    expect(config.hooks.PostToolUse[0].hooks[0].command).toBe('"/bin/bun" "/tmp/worker-service.cjs" hook codex-cli observation');
+    expect(config.hooks.Stop[0].hooks[0].command).toBe('"/bin/bun" "/tmp/worker-service.cjs" hook codex-cli summarize');
+  });
+
+  it('merges Codex hooks without deleting existing non-claude-mem hooks', async () => {
+    const {
+      buildCodexHookConfig,
+      mergeCodexHooksIntoConfig,
+    } = await import('../../src/services/integrations/CodexCliInstaller.js');
+
+    const existing: any = {
+      hooks: {
+        SessionStart: [
+          {
+            matcher: '*',
+            hooks: [
+              {
+                type: 'command',
+                name: 'operator-recorder',
+                command: 'python3 /tmp/recorder.py SessionStart',
+                timeout: 10,
+              },
+            ],
+          },
+          {
+            matcher: '*',
+            hooks: [
+              {
+                type: 'command',
+                name: 'claude-mem',
+                command: 'old claude-mem command',
+                timeout: 10,
+              },
+            ],
+          },
+        ],
+      },
+    };
+
+    const codexHooks = buildCodexHookConfig('/bin/bun', '/tmp/worker-service.cjs');
+    const merged = mergeCodexHooksIntoConfig(existing, codexHooks);
+    const sessionStartHooks = merged.hooks.SessionStart.flatMap((group) => group.hooks);
+
+    expect(sessionStartHooks.some((hook) => hook.name === 'operator-recorder')).toBe(true);
+    expect(sessionStartHooks.filter((hook) => hook.name === 'claude-mem')).toHaveLength(1);
+    expect(sessionStartHooks.find((hook) => hook.name === 'claude-mem')?.command)
+      .toBe('"/bin/bun" "/tmp/worker-service.cjs" hook codex-cli context');
+    expect(merged.hooks.UserPromptSubmit[0].hooks[0].command)
+      .toBe('"/bin/bun" "/tmp/worker-service.cjs" hook codex-cli session-init');
+  });
+
+  it('routes Codex SessionStart/UserPromptSubmit/PostToolUse/Stop through handler mainlines', async () => {
+    const requests: Array<{ path: string; init?: RequestInit }> = [];
+    const previousSemanticInject = process.env.CLAUDE_MEM_SEMANTIC_INJECT;
+    process.env.CLAUDE_MEM_SEMANTIC_INJECT = 'true';
+
+    mock.module('../../src/shared/worker-utils.js', () => ({
+      ensureWorkerRunning: async () => true,
+      getWorkerPort: () => 37777,
+      workerHttpRequest: async (path: string, init?: RequestInit) => {
+        requests.push({ path, init });
+
+        if (path.startsWith('/api/context/inject')) {
+          return new Response('codex startup context', { status: 200 });
+        }
+        if (path === '/api/sessions/init') {
+          return Response.json({ sessionDbId: 42, promptNumber: 1, contextInjected: false });
+        }
+        if (path === '/sessions/42/init') {
+          return Response.json({ ok: true });
+        }
+        if (path === '/api/context/semantic') {
+          return Response.json({ context: 'codex semantic context', count: 1 });
+        }
+        if (path === '/api/sessions/observations') {
+          return Response.json({ ok: true });
+        }
+        if (path === '/api/sessions/summarize') {
+          return Response.json({ status: 'queued' });
+        }
+
+        return new Response('unexpected path', { status: 404 });
+      },
+    }));
+
+    const tempDir = join(tmpdir(), `codex-hook-mainline-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(tempDir, { recursive: true });
+    const transcriptPath = join(tempDir, 'codex-session.jsonl');
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          content: [{ type: 'text', text: 'Codex assistant final answer' }],
+        },
+      }) + '\n',
+    );
+
+    try {
+      const { contextHandler } = await import('../../src/cli/handlers/context.js');
+      const { sessionInitHandler } = await import('../../src/cli/handlers/session-init.js');
+      const { observationHandler } = await import('../../src/cli/handlers/observation.js');
+      const { summarizeHandler } = await import('../../src/cli/handlers/summarize.js');
+
+      const baseInput = {
+        sessionId: 'codex-session-1',
+        cwd: tempDir,
+        platform: 'codex-cli',
+        transcriptPath,
+      };
+
+      const contextResult = await contextHandler.execute(baseInput);
+      expect(contextResult.hookSpecificOutput).toEqual({
+        hookEventName: 'SessionStart',
+        additionalContext: 'codex startup context',
+      });
+
+      const sessionResult = await sessionInitHandler.execute({
+        ...baseInput,
+        prompt: 'Please recall relevant prior work for this Codex task.',
+      });
+      expect(sessionResult.hookSpecificOutput).toEqual({
+        hookEventName: 'UserPromptSubmit',
+        additionalContext: 'codex semantic context',
+      });
+
+      const observationResult = await observationHandler.execute({
+        ...baseInput,
+        toolName: 'Bash',
+        toolUseId: 'call_bash_1',
+        toolInput: { command: 'printf ok' },
+        toolResponse: 'ok',
+      });
+      expect(observationResult.continue).toBe(true);
+
+      const summarizeResult = await summarizeHandler.execute(baseInput);
+      expect(summarizeResult.continue).toBe(true);
+      expect(summarizeResult.exitCode).toBe(0);
+
+      const initBody = JSON.parse(String(requests.find((r) => r.path === '/api/sessions/init')?.init?.body));
+      expect(initBody.platformSource).toBe('codex');
+
+      const observationBody = JSON.parse(String(requests.find((r) => r.path === '/api/sessions/observations')?.init?.body));
+      expect(observationBody.platformSource).toBe('codex');
+      expect(observationBody.tool_name).toBe('Bash');
+      expect(observationBody.toolUseId).toBe('call_bash_1');
+
+      const summarizeBody = JSON.parse(String(requests.find((r) => r.path === '/api/sessions/summarize')?.init?.body));
+      expect(summarizeBody.platformSource).toBe('codex');
+      expect(summarizeBody.last_assistant_message).toBe('Codex assistant final answer');
+    } finally {
+      if (previousSemanticInject === undefined) {
+        delete process.env.CLAUDE_MEM_SEMANTIC_INJECT;
+      } else {
+        process.env.CLAUDE_MEM_SEMANTIC_INJECT = previousSemanticInject;
+      }
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

@@ -39,6 +39,9 @@ export const observationHandler: EventHandler = {
 
     const { sessionId, cwd, toolName, toolInput, toolResponse } = input;
     const platformSource = normalizePlatformSource(input.platform);
+    const metadataToolUseId = input.metadata?.tool_use_id;
+    const toolUseId = input.toolUseId
+      ?? (typeof metadataToolUseId === 'string' ? metadataToolUseId : undefined);
 
     if (!toolName) {
       // No tool name provided - skip observation gracefully
@@ -66,6 +69,7 @@ export const observationHandler: EventHandler = {
       contentSessionId: sessionId,
       platformSource,
       tool_name: toolName,
+      toolUseId,
       tool_input: toolInput,
       tool_response: toolResponse,
       cwd,

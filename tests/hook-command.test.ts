@@ -8,7 +8,75 @@
  * - Programming errors (TypeError, etc.) → false (code bug, blocking)
  */
 import { describe, it, expect } from 'bun:test';
-import { isWorkerUnavailableError } from '../src/cli/hook-command.js';
+import { isWorkerUnavailableError, resolveHookEvent } from '../src/cli/hook-command.js';
+import { codexCliAdapter } from '../src/cli/adapters/codex-cli.js';
+import { geminiCliAdapter } from '../src/cli/adapters/gemini-cli.js';
+
+describe('resolveHookEvent', () => {
+  it('should map Codex native hook names into the existing hook-command mainline', () => {
+    expect(resolveHookEvent('codex', 'SessionStart')).toBe('context');
+    expect(resolveHookEvent('codex', 'UserPromptSubmit')).toBe('session-init');
+    expect(resolveHookEvent('codex', 'PostToolUse')).toBe('observation');
+    expect(resolveHookEvent('codex', 'Stop')).toBe('summarize');
+  });
+
+  it('should preserve existing internal event names and other platform behavior', () => {
+    expect(resolveHookEvent('codex', 'context')).toBe('context');
+    expect(resolveHookEvent('claude-code', 'SessionStart')).toBe('SessionStart');
+    expect(resolveHookEvent('raw', 'PostToolUse')).toBe('PostToolUse');
+  });
+});
+
+describe('Codex PostToolUse safety normalization', () => {
+  it('should promote tool_use_id to a stable first-class identity for observation accounting', () => {
+    const input = codexCliAdapter.normalizeInput({
+      session_id: 'codex-session-1',
+      cwd: '/repo',
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'printf ok' },
+      tool_response: 'ok',
+      tool_use_id: 'call_bash_123',
+    });
+
+    expect(input.toolUseId).toBe('call_bash_123');
+    expect(input.metadata?.tool_use_id).toBe('call_bash_123');
+  });
+
+  it('should omit unsupported suppressOutput from Codex hook output while preserving context fields', () => {
+    const output = codexCliAdapter.formatOutput({
+      continue: true,
+      suppressOutput: true,
+      exitCode: 0,
+      systemMessage: '\u001b[31mredacted status\u001b[0m',
+      hookSpecificOutput: {
+        hookEventName: 'PostToolUse',
+        additionalContext: 'codex observation context',
+      },
+    }) as Record<string, unknown>;
+
+    expect(output).toEqual({
+      continue: true,
+      systemMessage: 'redacted status',
+      additionalContext: 'codex observation context',
+    });
+    expect('suppressOutput' in output).toBe(false);
+    expect('exitCode' in output).toBe(false);
+    expect('status' in output).toBe(false);
+  });
+
+  it('should keep suppressOutput support in non-Codex adapters that own that contract', () => {
+    const output = geminiCliAdapter.formatOutput({
+      continue: true,
+      suppressOutput: true,
+    }) as Record<string, unknown>;
+
+    expect(output).toMatchObject({
+      continue: true,
+      suppressOutput: true,
+    });
+  });
+});
 
 describe('isWorkerUnavailableError', () => {
   describe('transport failures → true (graceful)', () => {
